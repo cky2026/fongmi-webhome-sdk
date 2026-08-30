@@ -354,6 +354,16 @@ public class WebHome extends Spider {
                     return bridge.intercept(req);
                 }
 
+                // 处理 main frame: 强制走我们的 intercept (解决 text/plain 源码显示问题)
+                @Override
+                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url, boolean isForMainFrame) {
+                    if (isForMainFrame && url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
+                        // 包装成 WebResourceRequest 让 intercept 走正常逻辑
+                        return bridge.intercept(url);
+                    }
+                    return null;
+                }
+
                 @Override
                 public void onPageStarted(WebView view, String url, Bitmap favicon) {
                     super.onPageStarted(view, url, favicon);
@@ -396,8 +406,13 @@ public class WebHome extends Spider {
 
         private void load(WebView webView, String url) {
             try {
-                if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("file://")) {
+                if (url.startsWith("http://") || url.startsWith("https://")) {
                     // 在 main 线程, 提前设 currentPageUrl 防止 intercept 拿不到
+                    if (bridge != null) bridge.setCurrentPageUrl(url);
+                    // 不用 loadUrl, 自己 fetch + loadData, 强制 text/html mime
+                    // 解决 Cloudflare Pages 等返回 text/plain 的问题
+                    fetchAndLoad(webView, url);
+                } else if (url.startsWith("file://")) {
                     if (bridge != null) bridge.setCurrentPageUrl(url);
                     webView.loadUrl(url);
                 } else {
@@ -406,6 +421,43 @@ public class WebHome extends Spider {
             } catch (Throwable th) {
                 webView.loadDataWithBaseURL(null, "<h1>加载失败</h1><small>" + th.getMessage() + "</small>", "text/html", "UTF-8", null);
             }
+        }
+
+        /**
+         * 自己用 HttpURLConnection fetch 主页, 强制当 text/html 喂给 WebView.
+         * 解决 Cloudflare Pages 等服务器返回 text/plain 的问题.
+         */
+        private void fetchAndLoad(final WebView webView, final String url) {
+            new Thread(() -> {
+                try {
+                    java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(30000);
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36");
+                    conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
+                    conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
+                    int code = conn.getResponseCode();
+                    String encoding = conn.getContentEncoding();
+                    java.io.InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+                    if (is == null) return;
+                    java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
+                    is.close();
+                    conn.disconnect();
+                    byte[] raw = baos.toByteArray();
+                    String text = new String(raw, "UTF-8");
+                    final String finalUrl = conn.getURL().toString();
+                    webView.post(() -> webView.loadDataWithBaseURL(finalUrl, text, "text/html", "UTF-8", null));
+                } catch (Throwable t) {
+                    final String msg = t.getMessage();
+                    webView.post(() -> webView.loadDataWithBaseURL(url,
+                            "<h1>加载失败</h1><small>" + (msg == null ? "未知错误" : msg) + "</small>",
+                            "text/html", "UTF-8", null));
+                }
+            }, "webhome-fetch").start();
         }
 
         private void hideSystemBars(Window w) {
