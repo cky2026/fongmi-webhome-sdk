@@ -1,47 +1,42 @@
 package com.github.catvod.spider;
 
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
 
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * FmActionHandler 默认实现 — 真正能用的播放 + 搜索 + 缓存。
+ * FmActionHandler 默认实现 — 在壳内启动 VideoActivity 播放。
  *
- * <p>通过反射调起 fongmi 壳的播放/搜索/历史 Activity (基于包名匹配)。
- * 如果反射失败则降级到 Intent.ACTION_VIEW 让系统选择播放器。
+ * <p>关键点: webhtv 实现的 playUrl 是调
+ * {@code VideoActivity.start(activity, SiteApi.PUSH, url, title, pic, null, wall, content)}
+ * 也就是直接启动壳自己的 VideoActivity (key=push_agent, id=URL)。
+ * VideoActivity 内部根据 key=push_agent 走 push_agent 链路解析播放。
  */
 public class DefaultFmActionHandler implements FmActionHandler {
 
     private static final String TAG = "WebHomeAction";
-    private static final Map<String, String> CACHE = new ConcurrentHashMap<>();
 
-    /** 壳包名前缀 — 反射调起 fongmi 系壳的 Activity */
-    private static final String[] FONGMI_PACKAGES = {
-            "com.fongmi.android.tv",
-            "com.fongmi.vodplus",
-            "com.github.tv.fongmi",
-            "com.github.catvod"
-    };
+    /** fongmi 壳的 push_agent key (SiteApi.PUSH 常量值) */
+    private static final String PUSH_AGENT_KEY = "push_agent";
 
     private final Context appContext;
-    private final PlayerLauncher player;
+    private final PlayerLauncher launcher;
 
     public DefaultFmActionHandler(Context context) {
         this.appContext = context != null ? context.getApplicationContext() : null;
-        this.player = new PlayerLauncher(appContext);
+        this.launcher = new PlayerLauncher(appContext);
     }
 
     // ============== 播放 ==============
@@ -49,9 +44,11 @@ public class DefaultFmActionHandler implements FmActionHandler {
     @Override
     public void playUrl(String url, String title, JSONObject options) {
         if (TextUtils.isEmpty(url)) return;
-        Log.d(TAG, "playUrl: " + url + " title=" + title);
+        Log.d(TAG, "playUrl: " + url);
         try {
-            player.play(url, title, options);
+            String pic = options != null ? options.optString("pic", "") : "";
+            String wallPic = options != null ? options.optString("wallPic", "") : "";
+            launcher.playInShell(url, title, pic, wallPic, PUSH_AGENT_KEY);
         } catch (Throwable t) {
             Log.e(TAG, "playUrl failed", t);
         }
@@ -60,20 +57,22 @@ public class DefaultFmActionHandler implements FmActionHandler {
     @Override
     public void playVod(String siteKey, String vodId, String title, String pic, JSONObject options) {
         if (TextUtils.isEmpty(siteKey) || TextUtils.isEmpty(vodId)) {
-            // 没有 siteKey/vodId 没法走 spider 链路，fallback 到 playUrl
+            // 没 siteKey/vodId 走 push_agent
             playUrl(vodId, title, options);
             return;
         }
         Log.d(TAG, "playVod: site=" + siteKey + " vod=" + vodId);
-        // fongmi 的 VideoActivity 通过 siteKey+vodId 调 spider
-        Intent intent = buildVideoIntent("site_vod", siteKey, vodId, title, pic, options);
-        tryStartActivity(intent, () -> fallbackPlayUrl(buildUrlFromOptions(urlFromVodId(vodId), options), title, options));
+        try {
+            String wallPic = options != null ? options.optString("wallPic", "") : "";
+            launcher.playInShell(vodId, title, pic, wallPic, siteKey);
+        } catch (Throwable t) {
+            Log.e(TAG, "playVod failed", t);
+        }
     }
 
     @Override
     public void playVodInline(JSONObject payload) {
         if (payload == null) return;
-        // 把 episodes[] 拼成 "线路1$url1#url2$线路2$url3" 的多集格式
         try {
             String title = payload.optString("vod_name", payload.optString("title", ""));
             String pic = payload.optString("vod_pic", payload.optString("pic", ""));
@@ -82,29 +81,34 @@ public class DefaultFmActionHandler implements FmActionHandler {
             String mark = payload.optString("mark", "");
             org.json.JSONArray episodes = payload.optJSONArray("episodes");
             if (episodes == null || episodes.length() == 0) {
-                playUrl("", title, null);
+                playUrl("", title, payload);
                 return;
             }
-            List<String> urls = new ArrayList<>();
-            List<String> names = new ArrayList<>();
-            for (int i = 0; i < episodes.length(); i++) {
-                org.json.JSONObject ep = episodes.optJSONObject(i);
-                if (ep == null) continue;
-                String name = ep.optString("name", String.valueOf(i + 1));
+            // 多集: 拼接为 vodId, 标记 (e.g. "episodes.json#WebHome#02")
+            // webhtv 走 WebHomeInlineVodStore, 这里简化: 把整个 payload 编码后作为 id
+            // 实际上更简单: 单集直接 playUrl, 多集也走 playUrl 但传拼接 url
+            // 单集: 传 url
+            if (episodes.length() == 1) {
+                org.json.JSONObject ep = episodes.optJSONObject(0);
                 String url = ep.optString("url", "");
                 if (ep.has("mediaUrl")) url = ep.optString("mediaUrl", url);
-                if (!TextUtils.isEmpty(url)) {
-                    urls.add(url);
-                    names.add(name);
-                }
-            }
-            if (urls.isEmpty()) {
-                playUrl("", title, null);
+                playUrl(url, title, payload);
                 return;
             }
-            String joined = TextUtils.join("#", urls);
-            // 单集/多集都走 playUrl
-            playUrl(joined, title, payload);
+            // 多集: 拼接 url 列表
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < episodes.length(); i++) {
+                if (i > 0) sb.append("#");
+                org.json.JSONObject ep = episodes.optJSONObject(i);
+                String url = ep.optString("url", "");
+                if (ep.has("mediaUrl")) url = ep.optString("mediaUrl", url);
+                sb.append(url);
+            }
+            // 多集: 用 vodInline 方案, 通过 WebHomeInlineVodStore 简化
+            // 这里直接传给 push_agent, 让壳去解析
+            String id = "webhome_inline:" + System.currentTimeMillis() + "#" + sb;
+            Log.d(TAG, "playVodInline: " + id);
+            launcher.playInShell(id, title, pic, wallPic, PUSH_AGENT_KEY);
         } catch (Throwable t) {
             Log.e(TAG, "playVodInline failed", t);
         }
@@ -112,12 +116,12 @@ public class DefaultFmActionHandler implements FmActionHandler {
 
     @Override
     public void preloadArtwork(String pic, String wallPic) {
-        // 默认 no-op — 壳如果有 Glide 预热可覆盖
+        // no-op (壳用 Glide 预热, 这里省略)
     }
 
     @Override
     public void controlPlayer(String action) {
-        // 默认 no-op — 壳可覆盖为 PlaybackService 控制
+        // no-op, 壳通过 PlaybackService 控制
     }
 
     @Override
@@ -125,32 +129,31 @@ public class DefaultFmActionHandler implements FmActionHandler {
         return new org.json.JSONObject();
     }
 
-    // ============== App 入口 — 反射调起 fongmi Activity ==============
+    // ============== App 入口 — 调壳 Activity ==============
 
     @Override
     public void search(String keyword, JSONObject options) {
-        if (TextUtils.isEmpty(keyword)) return;
-        tryStartActivity(buildSearchIntent(keyword, options), null);
+        launcher.openSearch(keyword, options != null && options.optBoolean("direct"));
     }
 
     @Override
     public void openVod() {
-        tryStartActivity(buildMainIntent("HomeActivity"), null);
+        launcher.openMainActivity("HomeActivity");
     }
 
     @Override
     public void openLive() {
-        tryStartActivity(buildMainIntent("LiveActivity"), null);
+        launcher.openMainActivity("LiveActivity");
     }
 
     @Override
     public void openKeep() {
-        tryStartActivity(buildMainIntent("KeepActivity"), null);
+        launcher.openMainActivity("KeepActivity");
     }
 
     @Override
     public void openSetting() {
-        tryStartActivity(buildMainIntent("SettingActivity"), null);
+        launcher.openMainActivity("SettingActivity");
     }
 
     @Override
@@ -158,7 +161,7 @@ public class DefaultFmActionHandler implements FmActionHandler {
         return new org.json.JSONObject();
     }
 
-    // ============== 缓存 ==============
+    // ============== 缓存 (SharedPreferences) ==============
 
     @Override
     public String cacheGet(String key, String rule) {
@@ -192,11 +195,7 @@ public class DefaultFmActionHandler implements FmActionHandler {
     @Override public void setToolbar(boolean visible) { }
     @Override public org.json.JSONObject getViewport() {
         org.json.JSONObject v = new org.json.JSONObject();
-        try {
-            v.put("width", 0);
-            v.put("height", 0);
-            v.put("chromeMode", "normal");
-        } catch (JSONException ignored) {}
+        try { v.put("chromeMode", "normal"); } catch (JSONException ignored) {}
         return v;
     }
 
@@ -253,7 +252,8 @@ public class DefaultFmActionHandler implements FmActionHandler {
     @Override
     public void extToast(String message) {
         if (appContext == null) return;
-        android.widget.Toast.makeText(appContext, message, android.widget.Toast.LENGTH_SHORT).show();
+        new Handler(Looper.getMainLooper()).post(() ->
+                android.widget.Toast.makeText(appContext, message, android.widget.Toast.LENGTH_SHORT).show());
     }
 
     @Override
@@ -270,11 +270,8 @@ public class DefaultFmActionHandler implements FmActionHandler {
         String type = payload.optString("type", "");
         String title = payload.optString("title", url);
         String pic = payload.optString("pic", "");
-        // panPlay 也走 playUrl — fongmi 壳能识别 magnet: / ed2k: / thunder: 等
-        // 链通过 push_agent 链路
-        if (url.startsWith("magnet:") || url.startsWith("ed2k:") || url.startsWith("thunder:")) {
-            playUrl(url, title, payload);
-        } else {
+        // 网盘推送/磁链都走 push_agent
+        if (!TextUtils.isEmpty(url)) {
             playUrl(url, title, payload);
         }
     }
@@ -283,96 +280,4 @@ public class DefaultFmActionHandler implements FmActionHandler {
     public void navigationBack() { }
     @Override
     public void navigationReload() { }
-
-    // ============== Intent 构建 — 反射调起 fongmi 壳 ==============
-
-    private Intent buildSearchIntent(String keyword, JSONObject options) {
-        Intent intent = new Intent();
-        intent.setAction(Intent.ACTION_SEARCH);
-        intent.putExtra("query", keyword);
-        if (options != null && options.optBoolean("direct")) {
-            intent.putExtra("direct", true);
-        }
-        return findActivity(intent, "SearchActivity");
-    }
-
-    private Intent buildMainIntent(String activityName) {
-        Intent intent = new Intent();
-        intent.setAction(Intent.ACTION_MAIN);
-        intent.addCategory(Intent.CATEGORY_LAUNCHER);
-        return findActivity(intent, activityName);
-    }
-
-    private Intent buildVideoIntent(String action, String siteKey, String vodId,
-                                    String title, String pic, JSONObject options) {
-        Intent intent = new Intent();
-        intent.setAction(action);
-        intent.putExtra("siteKey", siteKey);
-        intent.putExtra("vodId", vodId);
-        if (!TextUtils.isEmpty(title)) intent.putExtra("title", title);
-        if (!TextUtils.isEmpty(pic)) intent.putExtra("pic", pic);
-        if (options != null) {
-            if (options.has("wallPic")) intent.putExtra("wallPic", options.optString("wallPic"));
-            if (options.has("headers")) {
-                try {
-                    intent.putExtra("headers", options.getJSONObject("headers").toString());
-                } catch (JSONException ignored) {}
-            }
-        }
-        return findActivity(intent, "VideoActivity");
-    }
-
-    /** 在 fongmi 系壳的包名中找包含指定 Activity 名简写的类 */
-    private Intent findActivity(Intent intent, String simpleName) {
-        for (String pkg : FONGMI_PACKAGES) {
-            // 拼全类名
-            String[] candidates = {
-                    pkg + ".ui.activity." + simpleName,
-                    pkg + ".ui." + simpleName,
-                    pkg + "." + simpleName
-            };
-            for (String fqcn : candidates) {
-                try {
-                    Class<?> cls = Class.forName(fqcn);
-                    intent.setClassName(pkg, fqcn);
-                    return intent;
-                } catch (Throwable ignored) {}
-            }
-        }
-        return intent; // 找不到就返回原始 intent（可能 ACTION_SEARCH 等系统能处理）
-    }
-
-    private void tryStartActivity(Intent intent, Runnable fallback) {
-        if (intent == null || appContext == null) {
-            if (fallback != null) fallback.run();
-            return;
-        }
-        try {
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            appContext.startActivity(intent);
-        } catch (Throwable t) {
-            Log.w(TAG, "tryStartActivity failed, fallback", t);
-            if (fallback != null) fallback.run();
-        }
-    }
-
-    private void fallbackPlayUrl(String url, String title, JSONObject options) {
-        if (TextUtils.isEmpty(url)) return;
-        try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            intent.putExtra("title", title);
-            if (appContext != null) appContext.startActivity(intent);
-        } catch (Throwable t) {
-            Log.e(TAG, "fallbackPlayUrl failed", t);
-        }
-    }
-
-    private String urlFromVodId(String vodId) {
-        return vodId.startsWith("http") ? vodId : "";
-    }
-
-    private String buildUrlFromOptions(String url, JSONObject options) {
-        return url;
-    }
 }

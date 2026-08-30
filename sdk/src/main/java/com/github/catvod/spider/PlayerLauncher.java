@@ -3,28 +3,30 @@ package com.github.catvod.spider;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.net.Uri;
-import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
 
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-
 /**
- * PlayerLauncher — 启动 fongmi 壳的播放器。
+ * PlayerLauncher — 直接启动壳的 VideoActivity (在壳内播放, 不是外部 app)。
  *
- * <p>尝试顺序：
- * <ol>
- *   <li>反射调 fongmi 壳的 VideoActivity (调 spider 链路)</li>
- *   <li>反射调 fongmi 壳的 push_agent (SiteApi.PUSH)</li>
- *   <li>降级到 Intent.ACTION_VIEW 系统选择器</li>
- * </ol>
+ * <p>关键: webhtv 用 {@code VideoActivity.start(activity, SiteApi.PUSH, url, ...)}
+ * 启动的是壳自己的 VideoActivity, key=push_agent 让 VideoActivity 走 push 链路。
+ *
+ * <p>VideoActivity 接收的 Intent extras:
+ * <ul>
+ *   <li>key: 站点 key, push_agent = 推送播放</li>
+ *   <li>id: 视频 id 或 URL</li>
+ *   <li>name: 标题</li>
+ *   <li>pic: 海报</li>
+ *   <li>wallPic: 背景图</li>
+ *   <li>mark: 默认选中集</li>
+ * </ul>
  */
 class PlayerLauncher {
 
@@ -37,111 +39,127 @@ class PlayerLauncher {
             "com.github.catvod"
     };
 
+    /** 壳里 VideoActivity 类全名 (按已知包名 + 类名拼接) */
+    private static final String[][] VIDEO_ACTIVITY_CANDIDATES = {
+            {"com.fongmi.android.tv", "com.fongmi.android.tv.ui.activity.VideoActivity"},
+            {"com.fongmi.android.tv", "com.fongmi.android.tv.ui.video.VideoActivity"},
+            {"com.fongmi.vodplus",     "com.fongmi.vodplus.ui.activity.VideoActivity"},
+            {"com.github.tv.fongmi",   "com.github.tv.fongmi.ui.activity.VideoActivity"},
+            {"com.github.catvod",      "com.github.catvod.ui.activity.VideoActivity"}
+    };
+
     private final Context ctx;
+    private final Handler main;
 
     PlayerLauncher(Context context) {
         this.ctx = context;
+        this.main = new Handler(Looper.getMainLooper());
     }
 
-    void play(String url, String title, JSONObject options) {
-        Log.d(TAG, "play: " + url);
-        if (TextUtils.isEmpty(url)) return;
+    /**
+     * 在壳内播放
+     * @param id 视频 id 或 URL (push_agent 模式下 id 就是 URL)
+     * @param title 标题
+     * @param pic 海报
+     * @param wallPic 背景图
+     * @param key 站点 key, "push_agent" 表示推送播放
+     */
+    void playInShell(final String id, final String title, final String pic,
+                     final String wallPic, final String key) {
         if (ctx == null) return;
-
-        // 先尝试 fongmi 壳的 push_agent 链路 (SiteApi.PUSH)
-        // 那是 fongmi 壳的 spider 接入，能识别 m3u8/mp4/magnet 等
-        if (tryPushAgent(url, title, options)) return;
-        // 再尝试 fongmi 壳的 VideoActivity
-        if (tryVideoActivity(url, title, options)) return;
-        // 降级系统播放
-        fallbackToSystemPlayer(url, title);
+        main.post(() -> {
+            try {
+                Intent intent = new Intent();
+                intent.setComponent(findVideoActivity());
+                intent.putExtra("key", key);
+                intent.putExtra("id", id);
+                intent.putExtra("name", title == null ? "" : title);
+                intent.putExtra("pic", pic == null ? "" : pic);
+                intent.putExtra("wallPic", wallPic == null ? "" : wallPic);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(intent);
+                Log.d(TAG, "Started VideoActivity: key=" + key + " id=" + id);
+            } catch (Throwable t) {
+                Log.e(TAG, "playInShell failed, fallback to system", t);
+                fallbackToSystem(id, title);
+            }
+        });
     }
 
-    /** 尝试 fongmi 壳的 push_agent 链路 (SiteApi.PUSH key) */
-    private boolean tryPushAgent(String url, String title, JSONObject options) {
-        // 拼装 push:// 协议的 Intent，调用壳的 push_agent
-        String pushUrl = url.startsWith("push://") ? url : "push://" + url;
-        // fongmi 壳通过 SiteApi.PUSH key 的 VideoActivity
-        Intent intent = new Intent();
-        intent.setAction(Intent.ACTION_VIEW);
-        intent.setData(Uri.parse(pushUrl));
-        intent.putExtra("title", title);
-        intent.putExtra("siteKey", "push_agent");
-        intent.putExtra("vodId", pushUrl);
-        if (options != null) {
-            if (options.has("headers")) {
-                try {
-                    intent.putExtra("headers", options.getJSONObject("headers").toString());
-                } catch (JSONException ignored) {}
+    void openSearch(String keyword, boolean direct) {
+        main.post(() -> {
+            try {
+                Intent intent = new Intent("android.intent.action.SEARCH");
+                intent.putExtra("query", keyword);
+                if (direct) intent.putExtra("direct", true);
+                intent.setComponent(findComponentByActivityName("SearchActivity"));
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(intent);
+            } catch (Throwable t) {
+                Log.w(TAG, "openSearch failed", t);
             }
-            if (options.has("pic")) intent.putExtra("pic", options.optString("pic"));
-            if (options.has("wallPic")) intent.putExtra("wallPic", options.optString("wallPic"));
-        }
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-
-        // 尝试 setClassName 到 fongmi 壳
-        for (String pkg : FONGMI_PACKAGES) {
-            String[] classNames = {
-                    pkg + ".ui.activity.VideoActivity",
-                    pkg + ".ui.activity.PushActivity",
-                    pkg + ".ui.activity.PlayerActivity"
-            };
-            for (String fqcn : classNames) {
-                if (tryStartActivityWithClass(intent, pkg, fqcn)) {
-                    Log.d(TAG, "started VideoActivity: " + fqcn);
-                    return true;
-                }
-            }
-        }
-        return false;
+        });
     }
 
-    private boolean tryVideoActivity(String url, String title, JSONObject options) {
-        Intent intent = new Intent();
-        intent.setAction("android.intent.action.VIEW");
-        intent.putExtra("title", title);
-        intent.putExtra("siteKey", "push_agent");
-        intent.putExtra("vodId", url);
-        intent.setData(Uri.parse(url));
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-
-        for (String pkg : FONGMI_PACKAGES) {
-            String[] classNames = {
-                    pkg + ".ui.activity.VideoActivity",
-                    pkg + ".ui.video.VideoActivity"
-            };
-            for (String fqcn : classNames) {
-                if (tryStartActivityWithClass(intent, pkg, fqcn)) {
-                    return true;
-                }
+    void openMainActivity(String simpleName) {
+        main.post(() -> {
+            try {
+                Intent intent = new Intent(Intent.ACTION_MAIN);
+                intent.addCategory(Intent.CATEGORY_LAUNCHER);
+                intent.setComponent(findComponentByActivityName(simpleName));
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(intent);
+            } catch (Throwable t) {
+                Log.w(TAG, "openMainActivity " + simpleName + " failed", t);
             }
-        }
-        return false;
+        });
     }
 
-    private boolean tryStartActivityWithClass(Intent intent, String pkg, String fqcn) {
+    /** 在 fongmi 候选包名中找已安装的壳, 返回那个壳的 ComponentName */
+    private ComponentName findVideoActivity() {
+        for (String[] pair : VIDEO_ACTIVITY_CANDIDATES) {
+            String pkg = pair[0];
+            String fqcn = pair[1];
+            if (isInstalled(pkg) && classExists(fqcn)) {
+                return new ComponentName(pkg, fqcn);
+            }
+        }
+        // 兜底: 直接用 com.fongmi.android.tv
+        return new ComponentName("com.fongmi.android.tv",
+                "com.fongmi.android.tv.ui.activity.VideoActivity");
+    }
+
+    private ComponentName findComponentByActivityName(String simpleName) {
+        for (String[] pair : VIDEO_ACTIVITY_CANDIDATES) {
+            String pkg = pair[0];
+            String fqcn = pair[0] + ".ui.activity." + simpleName;
+            if (isInstalled(pkg) && classExists(fqcn)) {
+                return new ComponentName(pkg, fqcn);
+            }
+        }
+        return new ComponentName("com.fongmi.android.tv",
+                "com.fongmi.android.tv.ui.activity." + simpleName);
+    }
+
+    private boolean isInstalled(String pkg) {
+        if (ctx == null) return false;
         try {
-            Class<?> cls = Class.forName(fqcn);
-            if (!hasActivity(ctx, pkg, fqcn)) return false;
-            intent.setClassName(pkg, fqcn);
-            ctx.startActivity(intent);
+            return ctx.getPackageManager().getPackageInfo(pkg, 0) != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private boolean classExists(String fqcn) {
+        try {
+            Class.forName(fqcn);
             return true;
         } catch (Throwable t) {
             return false;
         }
     }
 
-    private boolean hasActivity(Context ctx, String pkg, String fqcn) {
-        try {
-            Intent probe = new Intent();
-            probe.setClassName(pkg, fqcn);
-            return ctx.getPackageManager().resolveActivity(probe, 0) != null;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private void fallbackToSystemPlayer(String url, String title) {
+    private void fallbackToSystem(String url, String title) {
         try {
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setDataAndType(Uri.parse(url), guessMimeType(url));
@@ -149,7 +167,7 @@ class PlayerLauncher {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             ctx.startActivity(intent);
         } catch (Throwable t) {
-            Log.e(TAG, "fallbackToSystemPlayer failed", t);
+            Log.e(TAG, "fallback failed", t);
         }
     }
 
