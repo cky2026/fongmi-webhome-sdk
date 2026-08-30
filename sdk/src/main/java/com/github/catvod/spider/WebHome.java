@@ -354,16 +354,6 @@ public class WebHome extends Spider {
                     return bridge.intercept(req);
                 }
 
-                // 处理 main frame: 强制走我们的 intercept (解决 text/plain 源码显示问题)
-                @Override
-                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url, boolean isForMainFrame) {
-                    if (isForMainFrame && url != null && (url.startsWith("http://") || url.startsWith("https://"))) {
-                        // 包装成 WebResourceRequest 让 intercept 走正常逻辑
-                        return bridge.intercept(url);
-                    }
-                    return null;
-                }
-
                 @Override
                 public void onPageStarted(WebView view, String url, Bitmap favicon) {
                     super.onPageStarted(view, url, favicon);
