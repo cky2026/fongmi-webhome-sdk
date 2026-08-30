@@ -33,26 +33,23 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FilterInputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
 public class WebHome extends Spider {
-
     private static final int MAX_ACTIVITY_RETRIES = 18;
     private static volatile Context appContext;
     private static volatile boolean lifecycleInstalled;
@@ -60,13 +57,9 @@ public class WebHome extends Spider {
     private static volatile WeakReference<Activity> foreground = new WeakReference<>(null);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
-
-    // 1. API 请求线程池（最大并发 12，防止 JS 卡死）
     private static final ExecutorService HTTP_EXECUTOR = Executors.newFixedThreadPool(12);
-
-    // 2. 图片拦截信号量（限制同时最多 6 个图片下载请求，其余在后台排队，防止挤爆网络）
-    private static final Semaphore IMAGE_SEMAPHORE = new Semaphore(6);
-
+    private static final ConcurrentHashMap<String, String> COOKIE_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Map<String, String>> HEADER_CACHE = new ConcurrentHashMap<>();
     private static volatile FmActionHandler globalHandler;
     private String extend = "";
 
@@ -82,9 +75,7 @@ public class WebHome extends Spider {
     public void init(Context context, String str) {
         if (context != null) {
             Context applicationContext = context.getApplicationContext();
-            if (applicationContext != null) {
-                context = applicationContext;
-            }
+            if (applicationContext != null) context = applicationContext;
             appContext = context;
             installLifecycleTracker(appContext);
         }
@@ -120,7 +111,9 @@ public class WebHome extends Spider {
                     if (i < MAX_ACTIVITY_RETRIES) {
                         MAIN.postDelayed(new Runnable() {
                             @Override
-                            public void run() { open(str, str2, i + 1); }
+                            public void run() {
+                                open(str, str2, i + 1);
+                            }
                         }, 180L);
                     }
                     return;
@@ -128,9 +121,7 @@ public class WebHome extends Spider {
                 remember(activity);
                 String normalize = normalize(str);
                 if (normalize.length() == 0) return;
-                if (overlay != null && overlay.isShowing()) {
-                    overlay.dismiss();
-                }
+                if (overlay != null && overlay.isShowing()) overlay.dismiss();
                 overlay = new Overlay(activity, normalize, str2);
                 overlay.show();
             }
@@ -141,9 +132,7 @@ public class WebHome extends Spider {
         MAIN.post(new Runnable() {
             @Override
             public void run() {
-                if (overlay != null) {
-                    overlay.dismiss();
-                }
+                if (overlay != null) overlay.dismiss();
                 overlay = null;
             }
         });
@@ -154,16 +143,36 @@ public class WebHome extends Spider {
         synchronized (LOCK) {
             if (lifecycleInstalled) return;
             ((Application) context).registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
-                @Override public void onActivityCreated(Activity a, Bundle b) { remember(a); }
-                @Override public void onActivityStarted(Activity a) { remember(a); }
-                @Override public void onActivityResumed(Activity a) { remember(a); }
-                @Override public void onActivityPaused(Activity a) { }
-                @Override public void onActivityStopped(Activity a) { }
-                @Override public void onActivitySaveInstanceState(Activity a, Bundle b) { }
-                @Override public void onActivityDestroyed(Activity a) {
-                    if (((Activity) foreground.get()) == a) {
-                        foreground = new WeakReference<>(null);
-                    }
+                @Override
+                public void onActivityCreated(Activity a, Bundle b) {
+                    remember(a);
+                }
+
+                @Override
+                public void onActivityStarted(Activity a) {
+                    remember(a);
+                }
+
+                @Override
+                public void onActivityResumed(Activity a) {
+                    remember(a);
+                }
+
+                @Override
+                public void onActivityPaused(Activity a) {
+                }
+
+                @Override
+                public void onActivityStopped(Activity a) {
+                }
+
+                @Override
+                public void onActivitySaveInstanceState(Activity a, Bundle b) {
+                }
+
+                @Override
+                public void onActivityDestroyed(Activity a) {
+                    if (foreground.get() == a) foreground = new WeakReference<>(null);
                 }
             });
             lifecycleInstalled = true;
@@ -196,97 +205,78 @@ public class WebHome extends Spider {
                     Field af = r.getClass().getDeclaredField("activity");
                     af.setAccessible(true);
                     Object act = af.get(r);
-                    if (act instanceof Activity && usable((Activity) act)) {
-                        return (Activity) act;
-                    }
+                    if (act instanceof Activity && usable((Activity) act)) return (Activity) act;
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        }
         return null;
     }
 
     private static String normalize(String str) {
         if (str == null) return "";
         String trim = str.trim();
-        if (trim.startsWith("file://") || trim.startsWith("http://") || trim.startsWith("https://")) {
-            return trim;
-        }
+        if (trim.startsWith("file://") || trim.startsWith("http://") || trim.startsWith("https://")) return trim;
         if (trim.startsWith("/")) return Uri.fromFile(new File(trim)).toString();
         return trim;
     }
 
-    // ================= Native 内部 HTTP 执行器 =================
+    // ================= Native 异步网络请求 =================
 
     public static String doNativeReq(String urlStr, String optJson) {
         JSONObject res = new JSONObject();
+        HttpURLConnection conn = null;
         try {
             JSONObject opt = TextUtils.isEmpty(optJson) ? new JSONObject() : new JSONObject(optJson);
             String method = opt.optString("method", "GET").toUpperCase();
             JSONObject headers = opt.optJSONObject("headers");
             String body = opt.optString("body", "");
             int timeout = opt.optInt("timeout", 20) * 1000;
-
             URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod(method);
             conn.setConnectTimeout(timeout);
             conn.setReadTimeout(timeout);
             conn.setInstanceFollowRedirects(true);
+            conn.setUseCaches(true);
+            conn.setDefaultUseCaches(true);
+            conn.setRequestProperty("Connection", "keep-alive");
             conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
-
             boolean hasUA = false;
             boolean hasCookie = false;
-
             if (headers != null) {
                 Iterator<String> keys = headers.keys();
                 while (keys.hasNext()) {
                     String k = keys.next();
                     String v = headers.optString(k, "");
-                    // 保留空值头（例如 Referer: ""）
                     conn.setRequestProperty(k, v);
                     if ("user-agent".equalsIgnoreCase(k)) hasUA = true;
                     if ("cookie".equalsIgnoreCase(k) && !TextUtils.isEmpty(v)) hasCookie = true;
                 }
             }
-
             if (!hasCookie) {
-                String cookie = CookieManager.getInstance().getCookie(urlStr);
-                if (!TextUtils.isEmpty(cookie)) {
-                    conn.setRequestProperty("Cookie", cookie);
-                }
+                String cookie = getCachedCookie(urlStr);
+                if (!TextUtils.isEmpty(cookie)) conn.setRequestProperty("Cookie", cookie);
             }
-
             if (!hasUA) {
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                conn.setRequestProperty("User-Agent", defaultUA());
             }
-
             if ("POST".equals(method) || "PUT".equals(method)) {
                 conn.setDoOutput(true);
-                if (!TextUtils.isEmpty(body)) {
-                    conn.getOutputStream().write(body.getBytes("UTF-8"));
-                }
+                if (!TextUtils.isEmpty(body)) conn.getOutputStream().write(body.getBytes("UTF-8"));
             }
-
             int code = conn.getResponseCode();
             res.put("status", code);
             res.put("ok", code >= 200 && code < 300);
-
-            InputStream is = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+            InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
             if (is != null) {
                 String encoding = conn.getContentEncoding();
-                if (encoding != null) {
-                    if (encoding.equalsIgnoreCase("gzip")) {
-                        is = new GZIPInputStream(is);
-                    } else if (encoding.equalsIgnoreCase("deflate")) {
-                        is = new InflaterInputStream(is);
-                    }
-                }
+                if ("gzip".equalsIgnoreCase(encoding)) is = new GZIPInputStream(is);
+                else if ("deflate".equalsIgnoreCase(encoding)) is = new InflaterInputStream(is);
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 byte[] buf = new byte[8192];
                 int len;
-                while ((len = is.read(buf)) != -1) {
-                    baos.write(buf, 0, len);
-                }
+                while ((len = is.read(buf)) != -1) baos.write(buf, 0, len);
                 is.close();
                 res.put("body", new String(baos.toByteArray(), "UTF-8"));
             } else {
@@ -297,47 +287,81 @@ public class WebHome extends Spider {
                 res.put("ok", false);
                 res.put("status", 0);
                 res.put("error", t.getMessage());
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            }
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
         }
         return res.toString();
     }
 
-    // ================= 图片资源排队与流控制 =================
+    // ================= fm.res 资源代理 =================
 
     private static class WebResourceData {
         int code = 200;
         String message = "OK";
         String contentType = "image/*";
         String contentRange = "";
+        String contentLength = "";
+        String etag = "";
+        String cacheControl = "";
+        String lastModified = "";
+        String expires = "";
+        String acceptRanges = "";
         InputStream stream;
     }
 
-    // 自动在流关闭时释放信号量的包装 InputStream
-    private static class SemaphoreInputStream extends FilterInputStream {
-        private final Semaphore semaphore;
-        private boolean released = false;
+    private static String defaultUA() {
+        return "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+    }
 
-        protected SemaphoreInputStream(InputStream in, Semaphore semaphore) {
-            super(in);
-            this.semaphore = semaphore;
+    private static String getCachedCookie(String url) {
+        try {
+            URL u = new URL(url);
+            String host = u.getHost();
+            if (TextUtils.isEmpty(host)) return null;
+            String cached = COOKIE_CACHE.get(host);
+            if (cached != null) return cached;
+            String cookie = CookieManager.getInstance().getCookie(url);
+            if (!TextUtils.isEmpty(cookie)) COOKIE_CACHE.put(host, cookie);
+            return cookie;
+        } catch (Throwable ignored) {
+            return null;
         }
+    }
 
-        @Override
-        public void close() throws IOException {
-            try {
-                super.close();
-            } finally {
-                release();
+    private static Map<String, String> getCachedHeaders(String headersJson) {
+        if (TextUtils.isEmpty(headersJson)) return Collections.emptyMap();
+        Map<String, String> cached = HEADER_CACHE.get(headersJson);
+        if (cached != null) return cached;
+        try {
+            JSONObject obj = new JSONObject(headersJson);
+            Map<String, String> map = new HashMap<>();
+            Iterator<String> keys = obj.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                map.put(key, obj.optString(key, ""));
             }
+            Map<String, String> result = Collections.unmodifiableMap(map);
+            if (HEADER_CACHE.size() > 100) HEADER_CACHE.clear();
+            HEADER_CACHE.put(headersJson, result);
+            return result;
+        } catch (Throwable ignored) {
+            return Collections.emptyMap();
         }
+    }
 
-        private synchronized void release() {
-            if (!released) {
-                released = true;
-                if (semaphore != null) {
-                    semaphore.release();
-                }
-            }
+    private static String safeHeader(HttpURLConnection conn, String name) {
+        try {
+            String value = conn.getHeaderField(name);
+            return value == null ? "" : value;
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 
@@ -345,96 +369,91 @@ public class WebHome extends Spider {
         if (uri == null) return null;
         String targetUrl = uri.getQueryParameter("url");
         if (TextUtils.isEmpty(targetUrl)) return null;
-
         String headersJson = uri.getQueryParameter("headers");
-        boolean acquired = false;
-
+        final long start = System.currentTimeMillis();
+        HttpURLConnection conn = null;
         try {
-            // 排队获取信号量，最多等待 10 秒
-            acquired = IMAGE_SEMAPHORE.tryAcquire(10, TimeUnit.SECONDS);
-            if (!acquired) return null;
-
             URL url = new URL(targetUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
+            conn.setReadTimeout(15000);
             conn.setInstanceFollowRedirects(true);
-            conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
+            conn.setUseCaches(true);
+            conn.setDefaultUseCaches(true);
+            conn.setRequestProperty("Connection", "keep-alive");
 
+            /*
+             * 图片本身已经压缩，关闭 gzip 可以减少服务器压缩和
+             * Java 解压带来的 CPU 开销，同时让图片保持原始流。
+             */
+            conn.setRequestProperty("Accept-Encoding", "identity");
+
+            Map<String, String> headers = getCachedHeaders(headersJson);
             boolean hasUA = false;
+            boolean hasCookie = false;
 
-            if (!TextUtils.isEmpty(headersJson)) {
-                try {
-                    JSONObject jsonObj = new JSONObject(headersJson);
-                    Iterator<String> keys = jsonObj.keys();
-                    while (keys.hasNext()) {
-                        String key = keys.next();
-                        String value = jsonObj.optString(key, "");
-                        conn.setRequestProperty(key, value);
-                        if ("user-agent".equalsIgnoreCase(key)) hasUA = true;
-                    }
-                } catch (Throwable ignored) {}
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                String key = entry.getKey();
+                String value = entry.getValue();
+                if (TextUtils.isEmpty(key)) continue;
+                conn.setRequestProperty(key, value == null ? "" : value);
+                if ("user-agent".equalsIgnoreCase(key)) hasUA = true;
+                if ("cookie".equalsIgnoreCase(key) && !TextUtils.isEmpty(value)) hasCookie = true;
             }
 
-            if (!TextUtils.isEmpty(extraRange)) {
-                conn.setRequestProperty("Range", extraRange);
+            if (!hasCookie) {
+                String cookie = getCachedCookie(targetUrl);
+                if (!TextUtils.isEmpty(cookie)) conn.setRequestProperty("Cookie", cookie);
             }
 
-            String cookie = CookieManager.getInstance().getCookie(targetUrl);
-            if (!TextUtils.isEmpty(cookie)) {
-                conn.setRequestProperty("Cookie", cookie);
-            }
+            if (!hasUA) conn.setRequestProperty("User-Agent", defaultUA());
 
-            if (!hasUA) {
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
-            }
+            if (!TextUtils.isEmpty(extraRange)) conn.setRequestProperty("Range", extraRange);
 
             conn.connect();
 
             int responseCode = conn.getResponseCode();
             String responseMessage = conn.getResponseMessage();
+            InputStream is = responseCode >= 400 ? conn.getErrorStream() : conn.getInputStream();
 
-            InputStream is = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
             if (is == null) {
-                if (acquired) IMAGE_SEMAPHORE.release();
+                conn.disconnect();
                 return null;
-            }
-
-            String encoding = conn.getContentEncoding();
-            if (encoding != null) {
-                if (encoding.equalsIgnoreCase("gzip")) {
-                    is = new GZIPInputStream(is);
-                } else if (encoding.equalsIgnoreCase("deflate")) {
-                    is = new InflaterInputStream(is);
-                }
             }
 
             WebResourceData data = new WebResourceData();
             data.code = responseCode;
             data.message = TextUtils.isEmpty(responseMessage) ? "OK" : responseMessage;
-            data.contentType = conn.getContentType() != null ? conn.getContentType() : "image/*";
-            data.contentRange = conn.getHeaderField("Content-Range");
-            // 将输入流包装，WebView 读取完毕或关闭流时会自动释放信号量
-            data.stream = new SemaphoreInputStream(is, IMAGE_SEMAPHORE);
+            data.contentType = TextUtils.isEmpty(conn.getContentType()) ? "image/*" : conn.getContentType();
+            data.contentRange = safeHeader(conn, "Content-Range");
+            data.contentLength = safeHeader(conn, "Content-Length");
+            data.etag = safeHeader(conn, "ETag");
+            data.cacheControl = safeHeader(conn, "Cache-Control");
+            data.lastModified = safeHeader(conn, "Last-Modified");
+            data.expires = safeHeader(conn, "Expires");
+            data.acceptRanges = safeHeader(conn, "Accept-Ranges");
+            data.stream = is;
 
+            android.util.Log.d("WebHome", "fm.res " + responseCode + " " + (System.currentTimeMillis() - start) + "ms " + targetUrl);
             return data;
-
         } catch (Throwable t) {
-            if (acquired) {
-                IMAGE_SEMAPHORE.release();
+            android.util.Log.e("WebHome", "fm.res error: " + targetUrl, t);
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
             }
-            android.util.Log.e("WebHome", "fetchResourceData error", t);
+            return null;
         }
-        return null;
     }
 
-    // ================= Native 桥接注入对象 =================
+    // ================= Native Bridge =================
 
     public static class NativeBridge {
         @JavascriptInterface
         public void asyncReq(final String reqId, final String url, final String options) {
-            // 扔进线程池异步执行，绝不卡死 WebView JS 主线程
             HTTP_EXECUTOR.execute(new Runnable() {
                 @Override
                 public void run() {
@@ -443,9 +462,7 @@ public class WebHome extends Spider {
                         @Override
                         public void run() {
                             if (overlay != null && overlay.web != null) {
-                                String js = "if(window.fm&&window.fm._onReqResult){window.fm._onReqResult("
-                                        + JSONObject.quote(reqId) + ","
-                                        + JSONObject.quote(resultJson) + ");}";
+                                String js = "if(window.fm&&window.fm._onReqResult){window.fm._onReqResult(" + JSONObject.quote(reqId) + "," + JSONObject.quote(resultJson) + ");}";
                                 overlay.web.evaluateJavascript(js, null);
                             }
                         }
@@ -462,9 +479,7 @@ public class WebHome extends Spider {
                 if (!TextUtils.isEmpty(options)) {
                     JSONObject opt = new JSONObject(options);
                     JSONObject headers = opt.optJSONObject("headers");
-                    if (headers != null) {
-                        encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
-                    }
+                    if (headers != null) encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
                 }
                 return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
             } catch (Throwable t) {
@@ -473,7 +488,7 @@ public class WebHome extends Spider {
         }
     }
 
-    // ================= Overlay UI 容器 =================
+    // ================= Overlay =================
 
     private static final class Overlay extends Dialog {
         private final Activity host;
@@ -510,11 +525,8 @@ public class WebHome extends Spider {
                 @Override
                 public boolean onKey(DialogInterface d, int keyCode, KeyEvent event) {
                     if (keyCode == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP) {
-                        if (web != null && web.canGoBack()) {
-                            web.goBack();
-                        } else {
-                            dismiss();
-                        }
+                        if (web != null && web.canGoBack()) web.goBack();
+                        else dismiss();
                         return true;
                     }
                     return false;
@@ -524,16 +536,16 @@ public class WebHome extends Spider {
 
         @Override
         public void onBackPressed() {
-            if (web != null && web.canGoBack()) {
-                web.goBack();
-            } else {
-                dismiss();
-            }
+            if (web != null && web.canGoBack()) web.goBack();
+            else dismiss();
         }
 
         @Override
         public void dismiss() {
-            try { CookieManager.getInstance().flush(); } catch (Throwable ignored) {}
+            try {
+                CookieManager.getInstance().flush();
+            } catch (Throwable ignored) {
+            }
             if (web != null) {
                 try {
                     web.stopLoading();
@@ -543,7 +555,8 @@ public class WebHome extends Spider {
                     web.clearHistory();
                     web.removeAllViews();
                     web.destroy();
-                } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {
+                }
                 web = null;
             }
             super.dismiss();
@@ -553,9 +566,8 @@ public class WebHome extends Spider {
         @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
         private void setupWebView(WebView v) {
             v.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-            if (Build.VERSION.SDK_INT >= 26) {
-                v.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true);
-            }
+            if (Build.VERSION.SDK_INT >= 26) v.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true);
+
             WebSettings s = v.getSettings();
             s.setJavaScriptEnabled(true);
             s.setDomStorageEnabled(true);
@@ -573,26 +585,28 @@ public class WebHome extends Spider {
             s.setAllowContentAccess(true);
             s.setAllowFileAccessFromFileURLs(true);
             s.setAllowUniversalAccessFromFileURLs(true);
-            if (Build.VERSION.SDK_INT >= 23) {
-                s.setOffscreenPreRaster(true);
-            }
+
+            if (Build.VERSION.SDK_INT >= 23) s.setOffscreenPreRaster(true);
+
             v.setBackgroundColor(0xFF000000);
             v.setOverScrollMode(View.OVER_SCROLL_NEVER);
             v.setScrollBarStyle(View.SCROLLBARS_INSIDE_OVERLAY);
             v.setFocusable(true);
             v.setFocusableInTouchMode(true);
             v.requestFocus();
+
             try {
                 CookieManager cm = CookieManager.getInstance();
                 cm.setAcceptCookie(true);
                 cm.setAcceptThirdPartyCookies(v, true);
-            } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {
+            }
 
             FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler(getContext());
             v.addJavascriptInterface(new FmBridge(v, h), "fongmiBridge");
             v.addJavascriptInterface(new NativeBridge(), "_nativeBridge");
-
             v.setWebChromeClient(new WebChromeClient());
+
             v.setWebViewClient(new WebViewClient() {
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView view, String url) {
@@ -607,9 +621,7 @@ public class WebHome extends Spider {
 
                 @Override
                 public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
-                    if (url != null && url.contains("/webResource")) {
-                        return handleWebResourceResponse(Uri.parse(url), null);
-                    }
+                    if (url != null && url.contains("/webResource")) return handleWebResourceResponse(Uri.parse(url), null);
                     return super.shouldInterceptRequest(view, url);
                 }
 
@@ -638,7 +650,10 @@ public class WebHome extends Spider {
                 @Override
                 public void onPageFinished(WebView view, String url) {
                     super.onPageFinished(view, url);
-                    try { CookieManager.getInstance().flush(); } catch (Throwable ignored) {}
+                    try {
+                        CookieManager.getInstance().flush();
+                    } catch (Throwable ignored) {
+                    }
                     injectSdk(view);
                 }
             });
@@ -648,16 +663,15 @@ public class WebHome extends Spider {
             WebResourceData data = fetchResourceData(uri, range);
             if (data == null) return null;
 
-            String mimeType = "image/*";
-            String encoding = "UTF-8";
-            if (data.contentType != null) {
+            String mimeType = "application/octet-stream";
+            String encoding = null;
+
+            if (!TextUtils.isEmpty(data.contentType)) {
                 String[] parts = data.contentType.split(";");
                 mimeType = parts[0].trim();
                 for (int i = 1; i < parts.length; i++) {
                     String p = parts[i].trim();
-                    if (p.toLowerCase().startsWith("charset=")) {
-                        encoding = p.substring(8).trim();
-                    }
+                    if (p.toLowerCase().startsWith("charset=")) encoding = p.substring(8).trim();
                 }
             }
 
@@ -666,53 +680,43 @@ public class WebHome extends Spider {
                 respHeaders.put("Access-Control-Allow-Origin", "*");
                 respHeaders.put("Access-Control-Allow-Credentials", "true");
                 respHeaders.put("Access-Control-Allow-Headers", "*");
-                if (!TextUtils.isEmpty(data.contentRange)) {
-                    respHeaders.put("Content-Range", data.contentRange);
-                }
 
-                return new WebResourceResponse(
-                        mimeType,
-                        encoding,
-                        data.code,
-                        data.message,
-                        respHeaders,
-                        data.stream
-                );
-            } else {
-                return new WebResourceResponse(mimeType, encoding, data.stream);
+                if (!TextUtils.isEmpty(data.contentRange)) respHeaders.put("Content-Range", data.contentRange);
+                if (!TextUtils.isEmpty(data.contentLength)) respHeaders.put("Content-Length", data.contentLength);
+                if (!TextUtils.isEmpty(data.etag)) respHeaders.put("ETag", data.etag);
+                if (!TextUtils.isEmpty(data.cacheControl)) respHeaders.put("Cache-Control", data.cacheControl);
+                if (!TextUtils.isEmpty(data.lastModified)) respHeaders.put("Last-Modified", data.lastModified);
+                if (!TextUtils.isEmpty(data.expires)) respHeaders.put("Expires", data.expires);
+                if (!TextUtils.isEmpty(data.acceptRanges)) respHeaders.put("Accept-Ranges", data.acceptRanges);
+
+                return new WebResourceResponse(mimeType, encoding, data.code, data.message, respHeaders, data.stream);
             }
+
+            return new WebResourceResponse(mimeType, encoding, data.stream);
         }
 
         private void injectSdk(WebView v) {
             try {
                 String js = FmSdk.get("normal", false);
-                // 彻底解决同步阻塞卡死的 纯异步 Promise 桥接脚本
-                String reqPolyfill = "if(window.fm && !window.fm._patched){" +
+                String reqPolyfill = "if(window.fm&&!window.fm._patched){" +
                         "window.fm._patched=true;" +
                         "window.fm._reqCallbacks={};" +
                         "window.fm._reqSeq=0;" +
                         "window.fm.req=function(u,o){return new Promise(function(resolve){" +
-                        "  var id='req_'+(++window.fm._reqSeq)+'_'+Date.now();" +
-                        "  window.fm._reqCallbacks[id]=function(res){" +
-                        "    if(o && o.responseType==='json' && typeof res.body==='string'){" +
-                        "      try{ res.body=JSON.parse(res.body); }catch(e){}" +
-                        "    }" +
-                        "    resolve(res);" +
-                        "  };" +
-                        "  try{ _nativeBridge.asyncReq(id, u, JSON.stringify(o||{})); }" +
-                        "  catch(e){ delete window.fm._reqCallbacks[id]; resolve({ok:false, status:0, error:e.message}); }" +
+                        "var id='req_'+(++window.fm._reqSeq)+'_'+Date.now();" +
+                        "window.fm._reqCallbacks[id]=function(res){" +
+                        "if(o&&o.responseType==='json'&&typeof res.body==='string'){try{res.body=JSON.parse(res.body);}catch(e){}}" +
+                        "resolve(res);};" +
+                        "try{_nativeBridge.asyncReq(id,u,JSON.stringify(o||{}));}" +
+                        "catch(e){delete window.fm._reqCallbacks[id];resolve({ok:false,status:0,error:e.message});}" +
                         "});};" +
-                        "window.fm._onReqResult=function(id, resJsonStr){" +
-                        "  var cb=window.fm._reqCallbacks[id];" +
-                        "  if(cb){" +
-                        "    delete window.fm._reqCallbacks[id];" +
-                        "    try{ cb(JSON.parse(resJsonStr)); }catch(e){ cb({ok:false, status:0, error:e.message}); }" +
-                        "  }" +
+                        "window.fm._onReqResult=function(id,resJsonStr){" +
+                        "var cb=window.fm._reqCallbacks[id];" +
+                        "if(cb){delete window.fm._reqCallbacks[id];try{cb(JSON.parse(resJsonStr));}catch(e){cb({ok:false,status:0,error:e.message});}}" +
                         "};" +
-                        "window.fm.res=function(u,o){" +
-                        "  try{ return _nativeBridge.res(u, JSON.stringify(o||{})); }catch(e){ return u; }" +
-                        "};" +
+                        "window.fm.res=function(u,o){try{return _nativeBridge.res(u,JSON.stringify(o||{}));}catch(e){return u;}};" +
                         "}";
+
                 v.evaluateJavascript(js + "\n" + reqPolyfill, null);
             } catch (Throwable t) {
                 android.util.Log.e("WebHome", "injectSdk failed", t);
@@ -725,9 +729,7 @@ public class WebHome extends Spider {
                 dismiss();
                 return true;
             }
-            if (url.startsWith("file://") || url.startsWith("http://") || url.startsWith("https://")) {
-                return false;
-            }
+            if (url.startsWith("file://") || url.startsWith("http://") || url.startsWith("https://")) return false;
             view.loadUrl(url);
             return true;
         }
@@ -745,8 +747,7 @@ public class WebHome extends Spider {
         }
 
         private void hideSystemBars(Window w) {
-            if (w == null) return;
-            w.getDecorView().setSystemUiVisibility(5894);
+            if (w != null) w.getDecorView().setSystemUiVisibility(5894);
         }
 
         @Override
