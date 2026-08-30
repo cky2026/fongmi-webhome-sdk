@@ -59,34 +59,57 @@ public class FmBridge {
     /**
      * 拦截 WebView 加载的图片/视频/CSS 资源, 加上必要的 Referer/UA 后代理取.
      * 同步阻塞 (WebView client 是工作线程, 直接跑 OkHttp 没问题).
+     *
+     * <p>Referer 优先级:
+     * <ol>
+     *   <li>当前 WebView 页面 URL (这是图床最常校验的, 浏览器行为)</li>
+     *   <li>site header.Referer 配置</li>
+     *   <li>请求的 URL origin (兜底)</li>
+     * </ol>
      */
     public WebResourceResponse intercept(WebView view, WebResourceRequest request) {
         if (request == null) return null;
         String url = request.getUrl().toString();
         if (TextUtils.isEmpty(url)) return null;
-        // 拦截的 url 通常是 cdn / 图床 等外链
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
-        // 不拦截 data: blob: 等
         if (url.startsWith("data:") || url.startsWith("blob:")) return null;
 
-        // 拿 site header 当作默认 Referer
+        // 优先用当前页面 URL 作 Referer (浏览器默认行为, 图床最常校验)
         String referer = null;
-        String userAgent = null;
-        if (handler != null) {
+        try {
+            if (view != null) {
+                String pageUrl = view.getUrl();
+                if (!TextUtils.isEmpty(pageUrl) && (pageUrl.startsWith("http://") || pageUrl.startsWith("https://"))) {
+                    referer = pageUrl;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // 如果当前页面是 file://, 用站点 header
+        if (referer == null && handler != null) {
             try {
                 org.json.JSONObject siteInfo = handler.siteInfo();
                 if (siteInfo != null) {
                     org.json.JSONObject h = siteInfo.optJSONObject("header");
                     if (h != null) {
-                        referer = h.optString("Referer", h.optString("referer", null));
-                        userAgent = h.optString("User-Agent", h.optString("user-agent", null));
+                        String r = h.optString("Referer", h.optString("referer", ""));
+                        if (!TextUtils.isEmpty(r)) referer = r;
                     }
                 }
             } catch (Throwable ignored) {}
         }
 
+        // 兜底: 用 URL 自己的 origin
+        if (referer == null) {
+            try {
+                String origin = request.getUrl().getScheme() + "://" + request.getUrl().getHost();
+                if (request.getUrl().getPort() != -1) origin += ":" + request.getUrl().getPort();
+                referer = origin + "/";
+            } catch (Throwable ignored) {}
+        }
+
         try {
-            return doIntercept(url, request, referer, userAgent);
+            return doIntercept(url, request, referer, null, request.isForMainFrame());
         } catch (Throwable t) {
             return null;
         }
@@ -97,20 +120,21 @@ public class FmBridge {
         if (TextUtils.isEmpty(url)) return null;
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
         try {
-            return doIntercept(url, null, null, null);
+            return doIntercept(url, null, null, null, false);
         } catch (Throwable t) {
             return null;
         }
     }
 
-    private WebResourceResponse doIntercept(String url, WebResourceRequest request, String referer, String userAgent) {
+    private WebResourceResponse doIntercept(String url, WebResourceRequest request, String referer,
+                                          String userAgent, boolean isForMainFrame) {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(30000);
             conn.setInstanceFollowRedirects(true);
-            // 默认 UA — 仿手机
+            // 仿手机 UA
             if (TextUtils.isEmpty(userAgent)) {
                 userAgent = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36";
             }
@@ -119,12 +143,12 @@ public class FmBridge {
             conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
             conn.setRequestProperty("Connection", "keep-alive");
 
-            // 防盗链: 用 site 的 header (referer)
+            // 防盗链: Referer (从上一步推断)
             if (!TextUtils.isEmpty(referer)) {
                 conn.setRequestProperty("Referer", referer);
             }
 
-            // 透传原始请求的 Range (图片分段 / 视频 Range 必需)
+            // 透传 Range (图片分段 / 视频 Range)
             if (request != null) {
                 String range = request.getRequestHeaders().get("Range");
                 if (!TextUtils.isEmpty(range)) {
@@ -145,8 +169,20 @@ public class FmBridge {
             byte[] raw = readAll(is, encoding);
 
             String mime = guessMimeType(url, conn.getContentType());
-            String charset = (mime.startsWith("text/") || mime.contains("javascript") || mime.contains("json")
-                    || mime.contains("xml")) ? "utf-8" : null;
+
+            // 关键: 如果是主框架加载且 mime 是 text/plain 或 octet-stream,
+            // 强制当 HTML 渲染 (webhtv 的 WebHomeRawAdapter 同样逻辑)
+            // 否则很多 CDN / Pages 返回 text/plain, WebView 会当文本显示
+            if (isForMainFrame && (mime == null || mime.isEmpty()
+                    || "text/plain".equalsIgnoreCase(mime)
+                    || "application/octet-stream".equalsIgnoreCase(mime))) {
+                mime = "text/html";
+            }
+
+            String charset = (mime.startsWith("text/") || mime.contains("javascript")
+                    || mime.contains("json") || mime.contains("xml")) ? "utf-8" : null;
+            // HTML 一定要 utf-8
+            if ("text/html".equalsIgnoreCase(mime)) charset = "utf-8";
 
             // 使用最稳定的 WebResourceResponse 构造方法 (API 21+)
             return new WebResourceResponse(mime, charset, new java.io.ByteArrayInputStream(raw));
