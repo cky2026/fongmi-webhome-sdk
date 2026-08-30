@@ -62,9 +62,14 @@ public class WebHome extends Spider {
 
     private String extend = "";
 
-    /** 壳可以注入自己的 handler; 不注入就用默认 no-op */
+    /** 壳可以注入自己的 handler; 不注入就用默认带播放/搜索/缓存的 handler */
     public static void setHandler(FmActionHandler handler) {
         globalHandler = handler;
+    }
+
+    /** 用默认 handler (反射调 fongmi 壳播放/搜索 Activity) */
+    public static void useDefaultHandler() {
+        globalHandler = new DefaultFmActionHandler(appContext);
     }
 
     public void init(Context context, String str) {
@@ -133,6 +138,10 @@ public class WebHome extends Spider {
                 overlay = null;
             }
         });
+    }
+
+    private static Context getContext() {
+        return appContext;
     }
 
     private static void installLifecycleTracker(Context context) {
@@ -315,7 +324,7 @@ public class WebHome extends Spider {
                 cm.setAcceptThirdPartyCookies(v, true);
             } catch (Throwable ignored) {}
 
-            FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler();
+            FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler(getContext());
             v.addJavascriptInterface(new FmBridge(v, h), "fongmiBridge");
             v.setWebChromeClient(new WebChromeClient());
             v.setWebViewClient(new WebViewClient() {
