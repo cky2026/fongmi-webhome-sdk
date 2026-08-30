@@ -82,6 +82,8 @@ public class FmBridge {
         boolean isMainFrame = false;
         try { isMainFrame = request.isForMainFrame(); } catch (Throwable ignored) {}
 
+        android.util.Log.d("WebHomeIntc", "intercept url=" + url + " main=" + isMainFrame + " page=" + currentPageUrl);
+
         // Referer 优先级: 当前页面 URL > site header.Referer > 请求 origin
         String referer = currentPageUrl;
         if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
@@ -109,18 +111,53 @@ public class FmBridge {
         }
 
         try {
-            return doIntercept(url, request, referer, null, isMainFrame);
+            WebResourceResponse r = doIntercept(url, request, referer, null, isMainFrame);
+            android.util.Log.d("WebHomeIntc", "intercept result=" + (r != null ? "ok" : "null") + " for " + url);
+            return r;
         } catch (Throwable t) {
+            android.util.Log.e("WebHomeIntc", "intercept FAILED for " + url, t);
             return null;
         }
     }
 
-    /** 老 API 兼容: shouldOverrideUrlLoading 调用 */
+    /** 老 API 兼容: shouldOverrideUrlLoading 调用 (sub-resource, 不强制 main frame mime) */
     public WebResourceResponse intercept(String url) {
         if (TextUtils.isEmpty(url)) return null;
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
+        // sub-resource (图片/css/js), 不强制 text/html
+        return intercept(url, false);
+    }
+
+    public WebResourceResponse intercept(String url, boolean isForMainFrame) {
+        if (TextUtils.isEmpty(url)) return null;
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
+        android.util.Log.d("WebHomeIntc", "intercept(url) url=" + url + " main=" + isForMainFrame + " page=" + currentPageUrl);
+
+        // 推断 Referer
+        String referer = currentPageUrl;
+        if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
+            referer = guessRefererFromUrl(url);
+        }
+        if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
+            referer = url;
+        }
+
         try {
-            return doIntercept(url, null, null, null, false);
+            WebResourceResponse r = doIntercept(url, null, referer, null, isForMainFrame);
+            android.util.Log.d("WebHomeIntc", "intercept(url) result=" + (r != null ? "ok" : "null") + " for " + url);
+            return r;
+        } catch (Throwable t) {
+            android.util.Log.e("WebHomeIntc", "intercept(url) FAILED for " + url, t);
+            return null;
+        }
+    }
+
+    private String guessRefererFromUrl(String url) {
+        try {
+            android.net.Uri u = android.net.Uri.parse(url);
+            String origin = u.getScheme() + "://" + u.getHost();
+            if (u.getPort() != -1) origin += ":" + u.getPort();
+            return origin + "/";
         } catch (Throwable t) {
             return null;
         }
