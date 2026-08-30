@@ -341,6 +341,7 @@ public class WebHome extends Spider {
                 }
 
                 // 关键: 拦截资源请求, 由 SDK 自己代理 (处理图片防盗链)
+                // 注意: 这个回调在 WebView worker 线程, 不能调 view.getXxx() 方法
                 @Override
                 public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url) {
                     return bridge.intercept(url);
@@ -349,18 +350,21 @@ public class WebHome extends Spider {
                 @Override
                 public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
                     if (req == null || req.getUrl() == null) return null;
-                    return bridge.intercept(view, req);
+                    return bridge.intercept(req);
                 }
 
                 @Override
                 public void onPageStarted(WebView view, String url, Bitmap favicon) {
                     super.onPageStarted(view, url, favicon);
+                    // 在 main 线程更新当前 URL — bridge.intercept 后续会读
+                    bridge.setCurrentPageUrl(url);
                     injectSdk(view);
                 }
 
                 @Override
                 public void onPageFinished(WebView view, String url) {
                     super.onPageFinished(view, url);
+                    bridge.setCurrentPageUrl(url);
                     try { CookieManager.getInstance().flush(); } catch (Throwable ignored) {}
                     injectSdk(view);
                 }
@@ -392,6 +396,8 @@ public class WebHome extends Spider {
         private void load(WebView webView, String url) {
             try {
                 if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("file://")) {
+                    // 在 main 线程, 提前设 currentPageUrl 防止 intercept 拿不到
+                    if (bridge != null) bridge.setCurrentPageUrl(url);
                     webView.loadUrl(url);
                 } else {
                     webView.loadDataWithBaseURL(null, "<h1>WebHome 路径无效</h1><small>" + url + "</small>", "text/html", "UTF-8", null);

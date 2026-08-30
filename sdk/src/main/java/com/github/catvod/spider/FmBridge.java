@@ -48,10 +48,19 @@ public class FmBridge {
     private final ConcurrentHashMap<String, String> results = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ResolverFuture> inlineResults = new ConcurrentHashMap<>();
 
+    // 当前 WebView 页面 URL — 在 onPageStarted/Finished 里设置, 不能在 intercept 里调 view.getUrl()
+    // 因为 shouldInterceptRequest 在 worker 线程, view.getUrl() 必须在 main 线程
+    private volatile String currentPageUrl = "";
+
     public FmBridge(WebView webView, FmActionHandler handler) {
         this.webView = webView;
         this.appContext = webView.getContext().getApplicationContext();
         this.handler = handler != null ? handler : new DefaultFmActionHandler(this.appContext);
+    }
+
+    /** 由 WebHome 在 main 线程调用, 更新当前页面 URL */
+    public void setCurrentPageUrl(String url) {
+        this.currentPageUrl = url == null ? "" : url;
     }
 
     // ============== 资源拦截 - 关键! 解决图片防盗链 ==============
@@ -60,56 +69,47 @@ public class FmBridge {
      * 拦截 WebView 加载的图片/视频/CSS 资源, 加上必要的 Referer/UA 后代理取.
      * 同步阻塞 (WebView client 是工作线程, 直接跑 OkHttp 没问题).
      *
-     * <p>Referer 优先级:
-     * <ol>
-     *   <li>当前 WebView 页面 URL (这是图床最常校验的, 浏览器行为)</li>
-     *   <li>site header.Referer 配置</li>
-     *   <li>请求的 URL origin (兜底)</li>
-     * </ol>
+     * <p>注意: 这个方法在 WebView worker 线程被调用, 不能调任何 view.getXxx() 方法
+     * (那些必须在 main 线程).
      */
-    public WebResourceResponse intercept(WebView view, WebResourceRequest request) {
+    public WebResourceResponse intercept(WebResourceRequest request) {
         if (request == null) return null;
         String url = request.getUrl().toString();
         if (TextUtils.isEmpty(url)) return null;
         if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
         if (url.startsWith("data:") || url.startsWith("blob:")) return null;
 
-        // 优先用当前页面 URL 作 Referer (浏览器默认行为, 图床最常校验)
-        String referer = null;
-        try {
-            if (view != null) {
-                String pageUrl = view.getUrl();
-                if (!TextUtils.isEmpty(pageUrl) && (pageUrl.startsWith("http://") || pageUrl.startsWith("https://"))) {
-                    referer = pageUrl;
-                }
-            }
-        } catch (Throwable ignored) {}
+        boolean isMainFrame = false;
+        try { isMainFrame = request.isForMainFrame(); } catch (Throwable ignored) {}
 
-        // 如果当前页面是 file://, 用站点 header
-        if (referer == null && handler != null) {
-            try {
-                org.json.JSONObject siteInfo = handler.siteInfo();
-                if (siteInfo != null) {
-                    org.json.JSONObject h = siteInfo.optJSONObject("header");
-                    if (h != null) {
-                        String r = h.optString("Referer", h.optString("referer", ""));
-                        if (!TextUtils.isEmpty(r)) referer = r;
+        // Referer 优先级: 当前页面 URL > site header.Referer > 请求 origin
+        String referer = currentPageUrl;
+        if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
+            // 当前页是 file://, 用 site header
+            if (handler != null) {
+                try {
+                    org.json.JSONObject siteInfo = handler.siteInfo();
+                    if (siteInfo != null) {
+                        org.json.JSONObject h = siteInfo.optJSONObject("header");
+                        if (h != null) {
+                            String r = h.optString("Referer", h.optString("referer", ""));
+                            if (!TextUtils.isEmpty(r)) referer = r;
+                        }
                     }
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // 兜底: 用 URL 自己的 origin
-        if (referer == null) {
-            try {
-                String origin = request.getUrl().getScheme() + "://" + request.getUrl().getHost();
-                if (request.getUrl().getPort() != -1) origin += ":" + request.getUrl().getPort();
-                referer = origin + "/";
-            } catch (Throwable ignored) {}
+                } catch (Throwable ignored) {}
+            }
+            // 兜底: 请求 URL 自己的 origin
+            if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
+                try {
+                    String origin = request.getUrl().getScheme() + "://" + request.getUrl().getHost();
+                    if (request.getUrl().getPort() != -1) origin += ":" + request.getUrl().getPort();
+                    referer = origin + "/";
+                } catch (Throwable ignored) {}
+            }
         }
 
         try {
-            return doIntercept(url, request, referer, null, request.isForMainFrame());
+            return doIntercept(url, request, referer, null, isMainFrame);
         } catch (Throwable t) {
             return null;
         }
