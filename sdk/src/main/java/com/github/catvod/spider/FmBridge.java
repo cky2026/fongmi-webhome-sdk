@@ -191,7 +191,7 @@ public class FmBridge {
         FmHttpResponse resp = doHttp(url, method, headers, body, responseType, timeout, includeCookie);
         JSONObject out = new JSONObject();
         try {
-            out.put("ok", resp.ok);
+            out.put("ok", resp.ok());
             out.put("status", resp.status);
             out.put("url", resp.url);
             if ("base64".equalsIgnoreCase(responseType)) {
