@@ -145,13 +145,11 @@ public class FmBridge {
             byte[] raw = readAll(is, encoding);
 
             String mime = guessMimeType(url, conn.getContentType());
-            String encoding_header = mime.startsWith("text/") || mime.contains("javascript") || mime.contains("json")
-                    ? "utf-8" : null;
-            int status = code >= 400 ? code : 200;
-            String reason = code >= 400 ? "HTTP " + code : "OK";
+            String charset = (mime.startsWith("text/") || mime.contains("javascript") || mime.contains("json")
+                    || mime.contains("xml")) ? "utf-8" : null;
 
-            return new WebResourceResponse(mime, encoding_header, status, reason,
-                    conn.getHeaderFields(), new java.io.ByteArrayInputStream(raw));
+            // 使用最稳定的 WebResourceResponse 构造方法 (API 21+)
+            return new WebResourceResponse(mime, charset, new java.io.ByteArrayInputStream(raw));
         } catch (Throwable t) {
             return null;
         } finally {
