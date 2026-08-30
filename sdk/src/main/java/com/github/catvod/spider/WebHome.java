@@ -18,6 +18,7 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -30,31 +31,20 @@ import com.github.catvod.crawler.Spider;
 
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.InflaterInputStream;
 
-/**
- * WebHome Spider — fongmi/catvod 系影视壳的 WebHome 接入点。
- *
- * <p>站点配置 (URL 写在 ext 字段, 跟 webhtv 一致):
- * <pre>
- * {
- *   "key": "webhome",
- *   "name": "WebHome 演示",
- *   "type": 3,
- *   "api": "csp_WebHome",
- *   "ext": "https://www.252035.xyz/xs/tvbox/nostr.html",
- *   "jar": "..."
- * }
- * </pre>
- */
 public class WebHome extends Spider {
 
     private static final int MAX_ACTIVITY_RETRIES = 18;
@@ -66,19 +56,17 @@ public class WebHome extends Spider {
     private static final Object LOCK = new Object();
 
     private static volatile FmActionHandler globalHandler;
-
     private String extend = "";
 
-    /** 壳可以注入自己的 handler; 不注入就用默认带播放/搜索/缓存的 handler */
     public static void setHandler(FmActionHandler handler) {
         globalHandler = handler;
     }
 
-    /** 用默认 handler (反射调 fongmi 壳播放/搜索 Activity) */
     public static void useDefaultHandler() {
         globalHandler = new DefaultFmActionHandler(appContext);
     }
 
+    @Override
     public void init(Context context, String str) {
         if (context != null) {
             Context applicationContext = context.getApplicationContext();
@@ -91,11 +79,13 @@ public class WebHome extends Spider {
         this.extend = str == null ? "" : str.trim();
     }
 
+    @Override
     public String homeContent(boolean z) {
         open(this.extend, runtimeSiteKey(), 0);
         return "{\"class\":[],\"list\":[]}";
     }
 
+    @Override
     public String homeVideoContent() {
         return "{\"list\":[]}";
     }
@@ -145,10 +135,6 @@ public class WebHome extends Spider {
                 overlay = null;
             }
         });
-    }
-
-    private static Context getContext() {
-        return appContext;
     }
 
     private static void installLifecycleTracker(Context context) {
@@ -217,6 +203,118 @@ public class WebHome extends Spider {
         return trim;
     }
 
+    // ================= Native 网络请求实现 (含 GZIP 解压与 Cookie) =================
+
+    public static String doNativeReq(String urlStr, String optJson) {
+        JSONObject res = new JSONObject();
+        try {
+            JSONObject opt = TextUtils.isEmpty(optJson) ? new JSONObject() : new JSONObject(optJson);
+            String method = opt.optString("method", "GET").toUpperCase();
+            JSONObject headers = opt.optJSONObject("headers");
+            String body = opt.optString("body", "");
+            int timeout = opt.optInt("timeout", 20) * 1000;
+
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod(method);
+            conn.setConnectTimeout(timeout);
+            conn.setReadTimeout(timeout);
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
+
+            boolean hasUA = false;
+            if (headers != null) {
+                Iterator<String> keys = headers.keys();
+                while (keys.hasNext()) {
+                    String k = keys.next();
+                    String v = headers.optString(k);
+                    if (!TextUtils.isEmpty(v)) {
+                        conn.setRequestProperty(k, v);
+                        if ("user-agent".equalsIgnoreCase(k)) hasUA = true;
+                    }
+                }
+            }
+
+            // 带上 WebView 的 Cookie
+            String cookie = CookieManager.getInstance().getCookie(urlStr);
+            if (!TextUtils.isEmpty(cookie)) {
+                conn.setRequestProperty("Cookie", cookie);
+            }
+
+            if (!hasUA) {
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+            }
+
+            if ("POST".equals(method) || "PUT".equals(method)) {
+                conn.setDoOutput(true);
+                if (!TextUtils.isEmpty(body)) {
+                    conn.getOutputStream().write(body.getBytes("UTF-8"));
+                }
+            }
+
+            int code = conn.getResponseCode();
+            res.put("status", code);
+            res.put("ok", code >= 200 && code < 300);
+
+            InputStream is = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+            if (is != null) {
+                String encoding = conn.getContentEncoding();
+                if (encoding != null) {
+                    if (encoding.equalsIgnoreCase("gzip")) {
+                        is = new GZIPInputStream(is);
+                    } else if (encoding.equalsIgnoreCase("deflate")) {
+                        is = new InflaterInputStream(is);
+                    }
+                }
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int len;
+                while ((len = is.read(buf)) != -1) {
+                    baos.write(buf, 0, len);
+                }
+                is.close();
+                res.put("body", new String(baos.toByteArray(), "UTF-8"));
+            } else {
+                res.put("body", "");
+            }
+        } catch (Throwable t) {
+            try {
+                res.put("ok", false);
+                res.put("status", 0);
+                res.put("error", t.getMessage());
+            } catch (Throwable ignored) {}
+        }
+        return res.toString();
+    }
+
+    // ================= Native 桥接注入对象 =================
+
+    public static class NativeBridge {
+        @JavascriptInterface
+        public String req(String url, String options) {
+            return doNativeReq(url, options);
+        }
+
+        @JavascriptInterface
+        public String res(String url, String options) {
+            try {
+                String encodedUrl = URLEncoder.encode(url, "UTF-8");
+                String encodedHeaders = "";
+                if (!TextUtils.isEmpty(options)) {
+                    JSONObject opt = new JSONObject(options);
+                    JSONObject headers = opt.optJSONObject("headers");
+                    if (headers != null) {
+                        encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
+                    }
+                }
+                // 对接壳自带的 9978 本地代理网关
+                return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
+            } catch (Throwable t) {
+                return url;
+            }
+        }
+    }
+
     // ================= Overlay =================
 
     private static final class Overlay extends Dialog {
@@ -282,6 +380,7 @@ public class WebHome extends Spider {
                 try {
                     web.stopLoading();
                     web.removeJavascriptInterface("fongmiBridge");
+                    web.removeJavascriptInterface("_nativeBridge");
                     web.loadUrl("about:blank");
                     web.clearHistory();
                     web.removeAllViews();
@@ -332,8 +431,9 @@ public class WebHome extends Spider {
             } catch (Throwable ignored) {}
 
             FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler(getContext());
-            final FmBridge bridge = new FmBridge(v, h);
-            v.addJavascriptInterface(bridge, "fongmiBridge");
+            v.addJavascriptInterface(new FmBridge(v, h), "fongmiBridge");
+            v.addJavascriptInterface(new NativeBridge(), "_nativeBridge");
+
             v.setWebChromeClient(new WebChromeClient());
             v.setWebViewClient(new WebViewClient() {
                 @Override
@@ -345,26 +445,6 @@ public class WebHome extends Spider {
                 public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                     if (req == null || req.getUrl() == null) return true;
                     return handleUrl(view, req.getUrl().toString());
-                }
-
-                // 拦截 /webResource 请求（处理 fm.res 调用的防盗链图片资源）
-                @Override
-                public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
-                    if (url != null && url.contains("/webResource")) {
-                        return handleWebResource(Uri.parse(url));
-                    }
-                    return super.shouldInterceptRequest(view, url);
-                }
-
-                @Override
-                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
-                    if (req != null && req.getUrl() != null) {
-                        String urlStr = req.getUrl().toString();
-                        if (urlStr.contains("/webResource")) {
-                            return handleWebResource(req.getUrl());
-                        }
-                    }
-                    return super.shouldInterceptRequest(view, req);
                 }
 
                 @Override
@@ -382,105 +462,26 @@ public class WebHome extends Spider {
             });
         }
 
-        private WebResourceResponse handleWebResource(Uri uri) {
-            if (uri == null) return null;
-            String targetUrl = uri.getQueryParameter("url");
-            if (TextUtils.isEmpty(targetUrl)) return null;
-
-            String headersJson = uri.getQueryParameter("headers");
-            String credentials = uri.getQueryParameter("credentials");
-
-            try {
-                URL url = new URL(targetUrl);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("GET");
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(15000);
-                conn.setInstanceFollowRedirects(true);
-
-                boolean hasUA = false;
-
-                // 1. 解析注入防盗链 Headers (Referer, User-Agent 等)
-                if (!TextUtils.isEmpty(headersJson)) {
-                    try {
-                        JSONObject jsonObj = new JSONObject(headersJson);
-                        Iterator<String> keys = jsonObj.keys();
-                        while (keys.hasNext()) {
-                            String key = keys.next();
-                            String value = jsonObj.getString(key);
-                            if (!TextUtils.isEmpty(value)) {
-                                conn.setRequestProperty(key, value);
-                                if ("user-agent".equalsIgnoreCase(key)) {
-                                    hasUA = true;
-                                }
-                            }
-                        }
-                    } catch (Throwable ignored) {}
-                }
-
-                // 2. 处理 credentials: "include" 自动带上 Cookie
-                if ("include".equals(credentials)) {
-                    String cookie = CookieManager.getInstance().getCookie(targetUrl);
-                    if (!TextUtils.isEmpty(cookie)) {
-                        conn.setRequestProperty("Cookie", cookie);
-                    }
-                }
-
-                // 3. 补充默认 UA
-                if (!hasUA) {
-                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
-                }
-
-                conn.connect();
-
-                int responseCode = conn.getResponseCode();
-                String responseMessage = conn.getResponseMessage();
-                if (responseMessage == null || responseMessage.isEmpty()) {
-                    responseMessage = "OK";
-                }
-
-                InputStream is = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
-                if (is == null) return null;
-
-                String contentType = conn.getContentType();
-                String mimeType = "image/*";
-                String encoding = "UTF-8";
-                if (contentType != null) {
-                    String[] parts = contentType.split(";");
-                    mimeType = parts[0].trim();
-                    for (int i = 1; i < parts.length; i++) {
-                        String p = parts[i].trim();
-                        if (p.toLowerCase().startsWith("charset=")) {
-                            encoding = p.substring(8).trim();
-                        }
-                    }
-                }
-
-                if (Build.VERSION.SDK_INT >= 21) {
-                    Map<String, String> respHeaders = new HashMap<>();
-                    respHeaders.put("Access-Control-Allow-Origin", "*");
-                    respHeaders.put("Access-Control-Allow-Credentials", "true");
-                    return new WebResourceResponse(
-                            mimeType,
-                            encoding,
-                            responseCode,
-                            responseMessage,
-                            respHeaders,
-                            is
-                    );
-                } else {
-                    return new WebResourceResponse(mimeType, encoding, is);
-                }
-            } catch (Throwable t) {
-                android.util.Log.e("WebHome", "handleWebResource error", t);
-            }
-            return null;
-        }
-
         private void injectSdk(WebView v) {
             try {
                 String js = FmSdk.get("normal", false);
-                v.evaluateJavascript(js, null);
+                // 补充对 fm.req 和 fm.res 的 Polyfill 映射，使其完美兼容 JS 端的 Promise 异步与 Native 通信
+                String reqPolyfill = "if(window.fm && !window.fm._patched){" +
+                        "window.fm._patched=true;" +
+                        "window.fm.req=function(u,o){return new Promise(function(resolve){" +
+                        "  try{" +
+                        "    var res=JSON.parse(_nativeBridge.req(u, JSON.stringify(o||{})));" +
+                        "    if(o && o.responseType==='json' && typeof res.body==='string'){" +
+                        "      try{ res.body=JSON.parse(res.body); }catch(e){}" +
+                        "    }" +
+                        "    resolve(res);" +
+                        "  }catch(e){ resolve({ok:false, status:0, error:e.message}); }" +
+                        "});};" +
+                        "window.fm.res=function(u,o){" +
+                        "  try{ return _nativeBridge.res(u, JSON.stringify(o||{})); }catch(e){ return u; }" +
+                        "};" +
+                        "}";
+                v.evaluateJavascript(js + "\n" + reqPolyfill, null);
             } catch (Throwable t) {
                 android.util.Log.e("WebHome", "injectSdk failed", t);
             }
