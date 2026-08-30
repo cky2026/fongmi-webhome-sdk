@@ -13,12 +13,14 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.TextUtils;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -26,12 +28,21 @@ import android.widget.FrameLayout;
 
 import com.github.catvod.crawler.Spider;
 
-import com.github.catvod.crawler.Spider;
+import org.json.JSONObject;
 
 import java.io.File;
+import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
+
+import okhttp3.Headers;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 /**
  * WebHome Spider — fongmi/catvod 系影视壳的 WebHome 接入点。
@@ -213,6 +224,11 @@ public class WebHome extends Spider {
     // ================= Overlay =================
 
     private static final class Overlay extends Dialog {
+        private static final OkHttpClient resHttpClient = new OkHttpClient.Builder()
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build();
+
         private final Activity host;
         private final String source;
         private final String sourceKey;
@@ -340,15 +356,24 @@ public class WebHome extends Spider {
                     return handleUrl(view, req.getUrl().toString());
                 }
 
-                // 资源让 WebView 自己加载 (图片防盗链 JS 端用 fm.req + headers 处理)
+                // 拦截 /webResource 请求（处理 fm.res 调用的防盗链图片资源）
                 @Override
-                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url) {
-                    return null;
+                public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
+                    if (url != null && url.contains("/webResource")) {
+                        return handleWebResource(Uri.parse(url));
+                    }
+                    return super.shouldInterceptRequest(view, url);
                 }
 
                 @Override
-                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
-                    return null;
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                    if (req != null && req.getUrl() != null) {
+                        String urlStr = req.getUrl().toString();
+                        if (urlStr.contains("/webResource")) {
+                            return handleWebResource(req.getUrl());
+                        }
+                    }
+                    return super.shouldInterceptRequest(view, req);
                 }
 
                 @Override
@@ -364,6 +389,89 @@ public class WebHome extends Spider {
                     injectSdk(view);
                 }
             });
+        }
+
+        private WebResourceResponse handleWebResource(Uri uri) {
+            if (uri == null) return null;
+            String targetUrl = uri.getQueryParameter("url");
+            if (TextUtils.isEmpty(targetUrl)) return null;
+
+            String headersJson = uri.getQueryParameter("headers");
+            String credentials = uri.getQueryParameter("credentials");
+
+            try {
+                Request.Builder requestBuilder = new Request.Builder().url(targetUrl);
+                Headers.Builder headersBuilder = new Headers.Builder();
+
+                // 1. 解析注入防盗链 Headers (Referer, User-Agent 等)
+                if (!TextUtils.isEmpty(headersJson)) {
+                    try {
+                        JSONObject jsonObj = new JSONObject(headersJson);
+                        Iterator<String> keys = jsonObj.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            String value = jsonObj.getString(key);
+                            if (!TextUtils.isEmpty(value)) {
+                                headersBuilder.add(key, value);
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+
+                // 2. 处理 credentials: "include" 自动带上 Cookie
+                if ("include".equals(credentials)) {
+                    String cookie = CookieManager.getInstance().getCookie(targetUrl);
+                    if (!TextUtils.isEmpty(cookie) && headersBuilder.get("Cookie") == null && headersBuilder.get("cookie") == null) {
+                        headersBuilder.add("Cookie", cookie);
+                    }
+                }
+
+                // 3. 补充默认 UA
+                if (headersBuilder.get("User-Agent") == null && headersBuilder.get("user-agent") == null) {
+                    headersBuilder.add("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                }
+
+                requestBuilder.headers(headersBuilder.build());
+
+                Response response = resHttpClient.newCall(requestBuilder.build()).execute();
+                ResponseBody body = response.body();
+                if (body == null) return null;
+
+                String contentType = response.header("Content-Type", "image/*");
+                String mimeType = "image/*";
+                String encoding = "UTF-8";
+                if (contentType != null) {
+                    String[] parts = contentType.split(";");
+                    mimeType = parts[0].trim();
+                    for (int i = 1; i < parts.length; i++) {
+                        String p = parts[i].trim();
+                        if (p.toLowerCase().startsWith("charset=")) {
+                            encoding = p.substring(8).trim();
+                        }
+                    }
+                }
+
+                InputStream is = body.byteStream();
+
+                if (Build.VERSION.SDK_INT >= 21) {
+                    Map<String, String> respHeaders = new HashMap<>();
+                    respHeaders.put("Access-Control-Allow-Origin", "*");
+                    respHeaders.put("Access-Control-Allow-Credentials", "true");
+                    return new WebResourceResponse(
+                            mimeType,
+                            encoding,
+                            response.code(),
+                            response.message().isEmpty() ? "OK" : response.message(),
+                            respHeaders,
+                            is
+                    );
+                } else {
+                    return new WebResourceResponse(mimeType, encoding, is);
+                }
+            } catch (Throwable t) {
+                android.util.Log.e("WebHome", "handleWebResource error", t);
+            }
+            return null;
         }
 
         private void injectSdk(WebView v) {
