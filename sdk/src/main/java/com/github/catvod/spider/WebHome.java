@@ -287,6 +287,96 @@ public class WebHome extends Spider {
         return res.toString();
     }
 
+    // ================= Native 资源拦截抓取 (专供 shouldInterceptRequest 图片处理) =================
+
+    private static class WebResourceData {
+        int code = 200;
+        String message = "OK";
+        String contentType = "image/*";
+        String contentRange = "";
+        InputStream stream;
+    }
+
+    private static WebResourceData fetchResourceData(Uri uri, String extraRange) {
+        if (uri == null) return null;
+        String targetUrl = uri.getQueryParameter("url");
+        if (TextUtils.isEmpty(targetUrl)) return null;
+
+        String headersJson = uri.getQueryParameter("headers");
+        String credentials = uri.getQueryParameter("credentials");
+
+        try {
+            URL url = new URL(targetUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(15000);
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
+
+            boolean hasUA = false;
+
+            if (!TextUtils.isEmpty(headersJson)) {
+                try {
+                    JSONObject jsonObj = new JSONObject(headersJson);
+                    Iterator<String> keys = jsonObj.keys();
+                    while (keys.hasNext()) {
+                        String key = keys.next();
+                        String value = jsonObj.getString(key);
+                        if (!TextUtils.isEmpty(value)) {
+                            conn.setRequestProperty(key, value);
+                            if ("user-agent".equalsIgnoreCase(key)) hasUA = true;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            if (!TextUtils.isEmpty(extraRange)) {
+                conn.setRequestProperty("Range", extraRange);
+            }
+
+            if ("include".equals(credentials) || TextUtils.isEmpty(credentials)) {
+                String cookie = CookieManager.getInstance().getCookie(targetUrl);
+                if (!TextUtils.isEmpty(cookie)) {
+                    conn.setRequestProperty("Cookie", cookie);
+                }
+            }
+
+            if (!hasUA) {
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+            }
+
+            conn.connect();
+
+            int responseCode = conn.getResponseCode();
+            String responseMessage = conn.getResponseMessage();
+
+            InputStream is = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
+            if (is == null) return null;
+
+            String encoding = conn.getContentEncoding();
+            if (encoding != null) {
+                if (encoding.equalsIgnoreCase("gzip")) {
+                    is = new GZIPInputStream(is);
+                } else if (encoding.equalsIgnoreCase("deflate")) {
+                    is = new InflaterInputStream(is);
+                }
+            }
+
+            WebResourceData data = new WebResourceData();
+            data.code = responseCode;
+            data.message = TextUtils.isEmpty(responseMessage) ? "OK" : responseMessage;
+            data.contentType = conn.getContentType() != null ? conn.getContentType() : "image/*";
+            data.contentRange = conn.getHeaderField("Content-Range");
+            data.stream = is;
+
+            return data;
+        } catch (Throwable t) {
+            android.util.Log.e("WebHome", "fetchResourceData error", t);
+        }
+        return null;
+    }
+
     // ================= Native 桥接注入对象 =================
 
     public static class NativeBridge {
@@ -307,7 +397,7 @@ public class WebHome extends Spider {
                         encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
                     }
                 }
-                // 对接壳自带的 9978 本地代理网关
+                // 返回本地网关链接，该链接会被下面的 shouldInterceptRequest 拦截处理
                 return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
             } catch (Throwable t) {
                 return url;
@@ -447,6 +537,31 @@ public class WebHome extends Spider {
                     return handleUrl(view, req.getUrl().toString());
                 }
 
+                // 拦截 /webResource 请求（拦截所有 fm.res 代理的防盗链图片）
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
+                    if (url != null && url.contains("/webResource")) {
+                        return handleWebResourceResponse(Uri.parse(url), null);
+                    }
+                    return super.shouldInterceptRequest(view, url);
+                }
+
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                    if (req != null && req.getUrl() != null) {
+                        String urlStr = req.getUrl().toString();
+                        if (urlStr.contains("/webResource")) {
+                            String range = null;
+                            if (req.getRequestHeaders() != null) {
+                                range = req.getRequestHeaders().get("Range");
+                                if (range == null) range = req.getRequestHeaders().get("range");
+                            }
+                            return handleWebResourceResponse(req.getUrl(), range);
+                        }
+                    }
+                    return super.shouldInterceptRequest(view, req);
+                }
+
                 @Override
                 public void onPageStarted(WebView view, String url, Bitmap favicon) {
                     super.onPageStarted(view, url, favicon);
@@ -462,10 +577,48 @@ public class WebHome extends Spider {
             });
         }
 
+        private WebResourceResponse handleWebResourceResponse(Uri uri, String range) {
+            WebResourceData data = fetchResourceData(uri, range);
+            if (data == null) return null;
+
+            String mimeType = "image/*";
+            String encoding = "UTF-8";
+            if (data.contentType != null) {
+                String[] parts = data.contentType.split(";");
+                mimeType = parts[0].trim();
+                for (int i = 1; i < parts.length; i++) {
+                    String p = parts[i].trim();
+                    if (p.toLowerCase().startsWith("charset=")) {
+                        encoding = p.substring(8).trim();
+                    }
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= 21) {
+                Map<String, String> respHeaders = new HashMap<>();
+                respHeaders.put("Access-Control-Allow-Origin", "*");
+                respHeaders.put("Access-Control-Allow-Credentials", "true");
+                respHeaders.put("Access-Control-Allow-Headers", "*");
+                if (!TextUtils.isEmpty(data.contentRange)) {
+                    respHeaders.put("Content-Range", data.contentRange);
+                }
+
+                return new WebResourceResponse(
+                        mimeType,
+                        encoding,
+                        data.code,
+                        data.message,
+                        respHeaders,
+                        data.stream
+                );
+            } else {
+                return new WebResourceResponse(mimeType, encoding, data.stream);
+            }
+        }
+
         private void injectSdk(WebView v) {
             try {
                 String js = FmSdk.get("normal", false);
-                // 补充对 fm.req 和 fm.res 的 Polyfill 映射，使其完美兼容 JS 端的 Promise 异步与 Native 通信
                 String reqPolyfill = "if(window.fm && !window.fm._patched){" +
                         "window.fm._patched=true;" +
                         "window.fm.req=function(u,o){return new Promise(function(resolve){" +
