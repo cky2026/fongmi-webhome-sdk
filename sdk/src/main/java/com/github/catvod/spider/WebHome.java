@@ -34,15 +34,11 @@ import java.io.File;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
-
-import okhttp3.Headers;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
 
 /**
  * WebHome Spider — fongmi/catvod 系影视壳的 WebHome 接入点。
@@ -224,11 +220,6 @@ public class WebHome extends Spider {
     // ================= Overlay =================
 
     private static final class Overlay extends Dialog {
-        private static final OkHttpClient resHttpClient = new OkHttpClient.Builder()
-                .followRedirects(true)
-                .followSslRedirects(true)
-                .build();
-
         private final Activity host;
         private final String source;
         private final String sourceKey;
@@ -400,8 +391,14 @@ public class WebHome extends Spider {
             String credentials = uri.getQueryParameter("credentials");
 
             try {
-                Request.Builder requestBuilder = new Request.Builder().url(targetUrl);
-                Headers.Builder headersBuilder = new Headers.Builder();
+                URL url = new URL(targetUrl);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET");
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(15000);
+                conn.setInstanceFollowRedirects(true);
+
+                boolean hasUA = false;
 
                 // 1. 解析注入防盗链 Headers (Referer, User-Agent 等)
                 if (!TextUtils.isEmpty(headersJson)) {
@@ -412,7 +409,10 @@ public class WebHome extends Spider {
                             String key = keys.next();
                             String value = jsonObj.getString(key);
                             if (!TextUtils.isEmpty(value)) {
-                                headersBuilder.add(key, value);
+                                conn.setRequestProperty(key, value);
+                                if ("user-agent".equalsIgnoreCase(key)) {
+                                    hasUA = true;
+                                }
                             }
                         }
                     } catch (Throwable ignored) {}
@@ -421,23 +421,28 @@ public class WebHome extends Spider {
                 // 2. 处理 credentials: "include" 自动带上 Cookie
                 if ("include".equals(credentials)) {
                     String cookie = CookieManager.getInstance().getCookie(targetUrl);
-                    if (!TextUtils.isEmpty(cookie) && headersBuilder.get("Cookie") == null && headersBuilder.get("cookie") == null) {
-                        headersBuilder.add("Cookie", cookie);
+                    if (!TextUtils.isEmpty(cookie)) {
+                        conn.setRequestProperty("Cookie", cookie);
                     }
                 }
 
                 // 3. 补充默认 UA
-                if (headersBuilder.get("User-Agent") == null && headersBuilder.get("user-agent") == null) {
-                    headersBuilder.add("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                if (!hasUA) {
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; ELI-AN00) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
                 }
 
-                requestBuilder.headers(headersBuilder.build());
+                conn.connect();
 
-                Response response = resHttpClient.newCall(requestBuilder.build()).execute();
-                ResponseBody body = response.body();
-                if (body == null) return null;
+                int responseCode = conn.getResponseCode();
+                String responseMessage = conn.getResponseMessage();
+                if (responseMessage == null || responseMessage.isEmpty()) {
+                    responseMessage = "OK";
+                }
 
-                String contentType = response.header("Content-Type", "image/*");
+                InputStream is = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
+                if (is == null) return null;
+
+                String contentType = conn.getContentType();
                 String mimeType = "image/*";
                 String encoding = "UTF-8";
                 if (contentType != null) {
@@ -451,8 +456,6 @@ public class WebHome extends Spider {
                     }
                 }
 
-                InputStream is = body.byteStream();
-
                 if (Build.VERSION.SDK_INT >= 21) {
                     Map<String, String> respHeaders = new HashMap<>();
                     respHeaders.put("Access-Control-Allow-Origin", "*");
@@ -460,8 +463,8 @@ public class WebHome extends Spider {
                     return new WebResourceResponse(
                             mimeType,
                             encoding,
-                            response.code(),
-                            response.message().isEmpty() ? "OK" : response.message(),
+                            responseCode,
+                            responseMessage,
                             respHeaders,
                             is
                     );
