@@ -49,7 +49,7 @@ public class FmBridge {
     public FmBridge(WebView webView, FmActionHandler handler) {
         this.webView = webView;
         this.appContext = webView.getContext().getApplicationContext();
-        this.handler = handler != null ? handler : new DefaultFmActionHandler();
+        this.handler = handler != null ? handler : new DefaultFmActionHandler(this.appContext);
     }
 
     // ============== JS 接口 (来自 webhtv) ==============

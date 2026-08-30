@@ -8,8 +8,11 @@ import org.json.JSONObject;
  */
 public interface FmActionHandler {
 
-    FmHttpResponse http(String url, String method, JSONObject headers, String body,
-                        String responseType, int timeout, boolean includeCookie);
+    /** FmBridge 走自己内置的 doHttp, 除非 handler 想接管。返回 null 表示让 FmBridge 走默认实现 */
+    default FmHttpResponse http(String url, String method, JSONObject headers, String body,
+                                String responseType, int timeout, boolean includeCookie) {
+        return null;
+    }
 
     void playUrl(String url, String title, JSONObject options);
     void playVod(String siteKey, String vodId, String title, String pic, JSONObject options);
