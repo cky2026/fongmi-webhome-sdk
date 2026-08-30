@@ -217,7 +217,6 @@ public class WebHome extends Spider {
         private final String source;
         private final String sourceKey;
         private WebView web;
-        private FmBridge bridge;
 
         Overlay(Activity activity, String source, String sourceKey) {
             super(activity, 0x0103000a);
@@ -326,7 +325,7 @@ public class WebHome extends Spider {
             } catch (Throwable ignored) {}
 
             FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler(getContext());
-            bridge = new FmBridge(v, h);
+            final FmBridge bridge = new FmBridge(v, h);
             v.addJavascriptInterface(bridge, "fongmiBridge");
             v.setWebChromeClient(new WebChromeClient());
             v.setWebViewClient(new WebViewClient() {
@@ -341,33 +340,26 @@ public class WebHome extends Spider {
                     return handleUrl(view, req.getUrl().toString());
                 }
 
-                // 关键: 拦截资源请求, 由 SDK 自己代理 (处理图片防盗链 + 强制主框架 HTML mime)
-                // 注意: 这个回调在 WebView worker 线程, 不能调 view.getXxx() 方法
-                // 老的 2 参版本 (String url) 总是返回 null, 让 WebView 自己加载
-                // 新版本 (WebResourceRequest) 处理所有 (主框架 + sub resource)
+                // 资源让 WebView 自己加载 (图片防盗链 JS 端用 fm.req + headers 处理)
                 @Override
                 public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url) {
-                    return null;  // 让 WebView 自己处理
+                    return null;
                 }
 
                 @Override
                 public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
-                    if (req == null || req.getUrl() == null) return null;
-                    return bridge.intercept(req);
+                    return null;
                 }
 
                 @Override
                 public void onPageStarted(WebView view, String url, Bitmap favicon) {
                     super.onPageStarted(view, url, favicon);
-                    // 在 main 线程更新当前 URL — bridge.intercept 后续会读
-                    bridge.setCurrentPageUrl(url);
                     injectSdk(view);
                 }
 
                 @Override
                 public void onPageFinished(WebView view, String url) {
                     super.onPageFinished(view, url);
-                    bridge.setCurrentPageUrl(url);
                     try { CookieManager.getInstance().flush(); } catch (Throwable ignored) {}
                     injectSdk(view);
                 }
@@ -399,8 +391,6 @@ public class WebHome extends Spider {
         private void load(WebView webView, String url) {
             try {
                 if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("file://")) {
-                    // 在 main 线程, 提前设 currentPageUrl 防止 intercept 拿不到
-                    if (bridge != null) bridge.setCurrentPageUrl(url);
                     webView.loadUrl(url);
                 } else {
                     webView.loadDataWithBaseURL(null, "<h1>WebHome 路径无效</h1><small>" + url + "</small>", "text/html", "UTF-8", null);

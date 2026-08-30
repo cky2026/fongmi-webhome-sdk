@@ -1,14 +1,11 @@
 package com.github.catvod.spider;
 
-import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Base64;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 
 import org.json.JSONException;
@@ -30,10 +27,10 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
 /**
- * FmBridge — fongmiBridge JS 接口 + 资源拦截。
+ * FmBridge — fongmiBridge JS 接口 + HTTP 桥.
+ * JS 字符串嵌入在 {@link FmSdk}, 通过 {@link #setCurrentPageUrl(String)} 跟踪当前页面 URL.
  *
- * <p>关键的图片防盗链靠 {@link #intercept(WebView, WebResourceRequest)} 在
- * shouldInterceptRequest 里直接代理资源请求, 不依赖壳的 NanoHTTPD.
+ * <p>不实现 shouldInterceptRequest — 资源由 WebView 自己加载.
  */
 public class FmBridge {
 
@@ -46,10 +43,7 @@ public class FmBridge {
     private final FmActionHandler handler;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ConcurrentHashMap<String, String> results = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, ResolverFuture> inlineResults = new ConcurrentHashMap<>();
 
-    // 当前 WebView 页面 URL — 在 onPageStarted/Finished 里设置, 不能在 intercept 里调 view.getUrl()
-    // 因为 shouldInterceptRequest 在 worker 线程, view.getUrl() 必须在 main 线程
     private volatile String currentPageUrl = "";
 
     public FmBridge(WebView webView, FmActionHandler handler) {
@@ -58,219 +52,16 @@ public class FmBridge {
         this.handler = handler != null ? handler : new DefaultFmActionHandler(this.appContext);
     }
 
-    /** 由 WebHome 在 main 线程调用, 更新当前页面 URL */
     public void setCurrentPageUrl(String url) {
         this.currentPageUrl = url == null ? "" : url;
     }
 
-    // ============== 资源拦截 - 关键! 解决图片防盗链 ==============
-
-    /**
-     * 拦截 WebView 加载的图片/视频/CSS 资源, 加上必要的 Referer/UA 后代理取.
-     * 同步阻塞 (WebView client 是工作线程, 直接跑 OkHttp 没问题).
-     *
-     * <p>注意: 这个方法在 WebView worker 线程被调用, 不能调任何 view.getXxx() 方法
-     * (那些必须在 main 线程).
-     */
-    public WebResourceResponse intercept(WebResourceRequest request) {
-        if (request == null) return null;
-        String url = request.getUrl().toString();
-        if (TextUtils.isEmpty(url)) return null;
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
-        if (url.startsWith("data:") || url.startsWith("blob:")) return null;
-
-        boolean isMainFrame = false;
-        try { isMainFrame = request.isForMainFrame(); } catch (Throwable ignored) {}
-
-        android.util.Log.d("WebHomeIntc", "intercept url=" + url + " main=" + isMainFrame + " page=" + currentPageUrl);
-
-        // Referer 优先级: 当前页面 URL > site header.Referer > 请求 origin
-        String referer = currentPageUrl;
-        if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
-            // 当前页是 file://, 用 site header
-            if (handler != null) {
-                try {
-                    org.json.JSONObject siteInfo = handler.siteInfo();
-                    if (siteInfo != null) {
-                        org.json.JSONObject h = siteInfo.optJSONObject("header");
-                        if (h != null) {
-                            String r = h.optString("Referer", h.optString("referer", ""));
-                            if (!TextUtils.isEmpty(r)) referer = r;
-                        }
-                    }
-                } catch (Throwable ignored) {}
-            }
-            // 兜底: 请求 URL 自己的 origin
-            if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
-                try {
-                    String origin = request.getUrl().getScheme() + "://" + request.getUrl().getHost();
-                    if (request.getUrl().getPort() != -1) origin += ":" + request.getUrl().getPort();
-                    referer = origin + "/";
-                } catch (Throwable ignored) {}
-            }
-        }
-
-        try {
-            WebResourceResponse r = doIntercept(url, request, referer, null, isMainFrame);
-            android.util.Log.d("WebHomeIntc", "intercept result=" + (r != null ? "ok" : "null") + " for " + url);
-            return r;
-        } catch (Throwable t) {
-            android.util.Log.e("WebHomeIntc", "intercept FAILED for " + url, t);
-            return null;
-        }
+    public String getCurrentPageUrl() {
+        return currentPageUrl;
     }
-
-    /** 老 API 兼容: shouldOverrideUrlLoading 调用 (sub-resource, 不强制 main frame mime) */
-    public WebResourceResponse intercept(String url) {
-        if (TextUtils.isEmpty(url)) return null;
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
-        // sub-resource (图片/css/js), 不强制 text/html
-        return intercept(url, false);
-    }
-
-    public WebResourceResponse intercept(String url, boolean isForMainFrame) {
-        if (TextUtils.isEmpty(url)) return null;
-        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
-        android.util.Log.d("WebHomeIntc", "intercept(url) url=" + url + " main=" + isForMainFrame + " page=" + currentPageUrl);
-
-        // 推断 Referer
-        String referer = currentPageUrl;
-        if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
-            referer = guessRefererFromUrl(url);
-        }
-        if (TextUtils.isEmpty(referer) || !(referer.startsWith("http://") || referer.startsWith("https://"))) {
-            referer = url;
-        }
-
-        try {
-            WebResourceResponse r = doIntercept(url, null, referer, null, isForMainFrame);
-            android.util.Log.d("WebHomeIntc", "intercept(url) result=" + (r != null ? "ok" : "null") + " for " + url);
-            return r;
-        } catch (Throwable t) {
-            android.util.Log.e("WebHomeIntc", "intercept(url) FAILED for " + url, t);
-            return null;
-        }
-    }
-
-    private String guessRefererFromUrl(String url) {
-        try {
-            android.net.Uri u = android.net.Uri.parse(url);
-            String origin = u.getScheme() + "://" + u.getHost();
-            if (u.getPort() != -1) origin += ":" + u.getPort();
-            return origin + "/";
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    private WebResourceResponse doIntercept(String url, WebResourceRequest request, String referer,
-                                          String userAgent, boolean isForMainFrame) {
-        HttpURLConnection conn = null;
-        try {
-            conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(30000);
-            conn.setInstanceFollowRedirects(true);
-            // 仿手机 UA
-            if (TextUtils.isEmpty(userAgent)) {
-                userAgent = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36";
-            }
-            conn.setRequestProperty("User-Agent", userAgent);
-            conn.setRequestProperty("Accept", "*/*");
-            conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
-            conn.setRequestProperty("Connection", "keep-alive");
-
-            // 防盗链: Referer (从上一步推断)
-            if (!TextUtils.isEmpty(referer)) {
-                conn.setRequestProperty("Referer", referer);
-            }
-
-            // 透传 Range (图片分段 / 视频 Range)
-            if (request != null) {
-                String range = request.getRequestHeaders().get("Range");
-                if (!TextUtils.isEmpty(range)) {
-                    conn.setRequestProperty("Range", range);
-                }
-            }
-
-            // 写 cookie
-            try {
-                String cookie = CookieManager.getInstance().getCookie(url);
-                if (!TextUtils.isEmpty(cookie)) conn.setRequestProperty("Cookie", cookie);
-            } catch (Throwable ignored) {}
-
-            int code = conn.getResponseCode();
-            String encoding = conn.getContentEncoding();
-            InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-            if (is == null) return null;
-            byte[] raw = readAll(is, encoding);
-
-            String mime = guessMimeType(url, conn.getContentType());
-
-            // 关键: 如果是主框架加载且 mime 是 text/plain 或 octet-stream,
-            // 强制当 HTML 渲染 (webhtv 的 WebHomeRawAdapter 同样逻辑)
-            // 否则很多 CDN / Pages 返回 text/plain, WebView 会当文本显示
-            if (isForMainFrame && (mime == null || mime.isEmpty()
-                    || "text/plain".equalsIgnoreCase(mime)
-                    || "application/octet-stream".equalsIgnoreCase(mime))) {
-                mime = "text/html";
-            }
-
-            String charset = (mime.startsWith("text/") || mime.contains("javascript")
-                    || mime.contains("json") || mime.contains("xml")) ? "utf-8" : null;
-            // HTML 一定要 utf-8
-            if ("text/html".equalsIgnoreCase(mime)) charset = "utf-8";
-
-            // 使用最稳定的 WebResourceResponse 构造方法 (API 21+)
-            return new WebResourceResponse(mime, charset, new java.io.ByteArrayInputStream(raw));
-        } catch (Throwable t) {
-            return null;
-        } finally {
-            if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
-        }
-    }
-
-    private String guessMimeType(String url, String contentType) {
-        if (!TextUtils.isEmpty(contentType)) return contentType;
-        String lower = url.toLowerCase();
-        if (lower.contains(".jpg") || lower.contains(".jpeg")) return "image/jpeg";
-        if (lower.contains(".png")) return "image/png";
-        if (lower.contains(".gif")) return "image/gif";
-        if (lower.contains(".webp")) return "image/webp";
-        if (lower.contains(".svg")) return "image/svg+xml";
-        if (lower.contains(".ico")) return "image/x-icon";
-        if (lower.contains(".m3u8")) return "application/x-mpegURL";
-        if (lower.contains(".mp4")) return "video/mp4";
-        if (lower.contains(".ts")) return "video/mp2t";
-        if (lower.contains(".webm")) return "video/webm";
-        if (lower.contains(".mp3")) return "audio/mpeg";
-        if (lower.contains(".m4a") || lower.contains(".aac")) return "audio/aac";
-        if (lower.contains(".css")) return "text/css";
-        if (lower.contains(".js")) return "application/javascript";
-        if (lower.contains(".json")) return "application/json";
-        if (lower.contains(".woff") || lower.contains(".woff2")) return "font/woff2";
-        if (lower.contains(".ttf")) return "font/ttf";
-        return "application/octet-stream";
-    }
-
-    private static byte[] readAll(InputStream in, String encoding) throws IOException {
-        if (in == null) return new byte[0];
-        try {
-            if ("gzip".equalsIgnoreCase(encoding)) in = new GZIPInputStream(in);
-            else if ("deflate".equalsIgnoreCase(encoding)) in = new InflaterInputStream(in);
-        } catch (IOException ignored) {}
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buf = new byte[8192];
-        int n;
-        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-        in.close();
-        return out.toByteArray();
-    }
-
-    // ============== JS 接口 ==============
 
     @JavascriptInterface
-    public void invoke(String requestId, String method, String payload) {
+    public void invoke(final String requestId, final String method, final String payload) {
         POOL.execute(() -> {
             try {
                 String result = handle(method, parseObject(payload));
@@ -332,24 +123,14 @@ public class FmBridge {
 
     @JavascriptInterface
     public void inlineResult(String id, String payload) {
-        ResolverFuture f = inlineResults.remove(id);
-        if (f != null) {
-            try {
-                JSONObject obj = TextUtils.isEmpty(payload) ? new JSONObject() : new JSONObject(payload);
-                f.complete(obj);
-            } catch (JSONException e) {
-                f.completeExceptionally(e);
-            }
-        }
+        // 占位 — 默认 no-op
     }
-
-    // ============== method dispatch ==============
 
     private String handle(String method, JSONObject payload) {
         if (handler == null) return "{}";
         switch (method) {
-            case "net.request":         return handleNetRequest(payload);
-            case "net.resourceUrl":     return quote(resourceUrl(payload.optString("url"), payload.toString()));
+            case "net.request":     return handleNetRequest(payload);
+            case "net.resourceUrl": return quote(resourceUrl(payload.optString("url"), payload.toString()));
 
             case "player.playUrl":      handler.playUrl(payload.optString("url"), payload.optString("title"), payload); return "{}";
             case "player.playVod":      handler.playVod(payload.optString("siteKey"), payload.optString("vodId"),
@@ -480,7 +261,19 @@ public class FmBridge {
         }
     }
 
-    // ============== resolve / reject ==============
+    private static byte[] readAll(InputStream in, String encoding) throws IOException {
+        if (in == null) return new byte[0];
+        try {
+            if ("gzip".equalsIgnoreCase(encoding)) in = new GZIPInputStream(in);
+            else if ("deflate".equalsIgnoreCase(encoding)) in = new InflaterInputStream(in);
+        } catch (IOException ignored) {}
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        in.close();
+        return out.toByteArray();
+    }
 
     private void resolve(String requestId, String value) {
         if (value == null) value = "{}";
@@ -510,8 +303,6 @@ public class FmBridge {
         else main.post(r);
     }
 
-    // ============== util ==============
-
     private static String quote(String s) {
         if (s == null) return "\"\"";
         StringBuilder sb = new StringBuilder("\"");
@@ -539,37 +330,5 @@ public class FmBridge {
     private static JSONObject parseObject(String s) {
         if (TextUtils.isEmpty(s)) return new JSONObject();
         try { return new JSONObject(s); } catch (JSONException e) { return new JSONObject(); }
-    }
-
-    // ============== inline resolver ==============
-
-    public void resolveInline(JSONObject episode, ResolverFuture future) {
-        String id = "inline_" + UUID.randomUUID().toString().replace("-", "");
-        inlineResults.put(id, future);
-        String episodeJson = episode.toString().replace("\\", "\\\\").replace("'", "\\'");
-        String script = "(function(){"
-                + "var ep=" + episodeJson + ";"
-                + "var r=window.__fmWebHomeInlineResolver||window.__fmYmvidResolveEpisode;"
-                + "if(typeof r!=='function'){"
-                + "  window.fongmiBridge.inlineResult('" + id + "',JSON.stringify({error:'no inline resolver'}));"
-                + "  return;"
-                + "}"
-                + "Promise.resolve().then(function(){return r(ep);}).then(function(v){"
-                + "  window.fongmiBridge.inlineResult('" + id + "',JSON.stringify(v||{}));"
-                + "},function(e){"
-                + "  window.fongmiBridge.inlineResult('" + id + "',JSON.stringify({error:(e&&e.message)||String(e)}));"
-                + "});"
-                + "})();";
-        runOnUi(() -> {
-            try { webView.evaluateJavascript(script, null); } catch (Throwable t) { future.completeExceptionally(t); }
-        });
-    }
-
-    public static class ResolverFuture {
-        public final String id;
-        public final java.util.concurrent.CompletableFuture<JSONObject> future = new java.util.concurrent.CompletableFuture<>();
-        public ResolverFuture(String id) { this.id = id; }
-        public void complete(JSONObject v) { future.complete(v); }
-        public void completeExceptionally(Throwable t) { future.completeExceptionally(t); }
     }
 }
