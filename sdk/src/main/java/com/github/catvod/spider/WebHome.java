@@ -33,6 +33,8 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FilterInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
@@ -44,6 +46,8 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
@@ -57,8 +61,11 @@ public class WebHome extends Spider {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
 
-    // 引入后台线程池，防止网络请求卡死 WebView JS 主线程
+    // 1. API 请求线程池（最大并发 12，防止 JS 卡死）
     private static final ExecutorService HTTP_EXECUTOR = Executors.newFixedThreadPool(12);
+
+    // 2. 图片拦截信号量（限制同时最多 6 个图片下载请求，其余在后台排队，防止挤爆网络）
+    private static final Semaphore IMAGE_SEMAPHORE = new Semaphore(6);
 
     private static volatile FmActionHandler globalHandler;
     private String extend = "";
@@ -208,7 +215,7 @@ public class WebHome extends Spider {
         return trim;
     }
 
-    // ================= Native 异步网络请求实现 =================
+    // ================= Native 内部 HTTP 执行器 =================
 
     public static String doNativeReq(String urlStr, String optJson) {
         JSONObject res = new JSONObject();
@@ -235,14 +242,13 @@ public class WebHome extends Spider {
                 while (keys.hasNext()) {
                     String k = keys.next();
                     String v = headers.optString(k, "");
-                    // 允许传递空值 (如 Referer: "")
+                    // 保留空值头（例如 Referer: ""）
                     conn.setRequestProperty(k, v);
                     if ("user-agent".equalsIgnoreCase(k)) hasUA = true;
                     if ("cookie".equalsIgnoreCase(k) && !TextUtils.isEmpty(v)) hasCookie = true;
                 }
             }
 
-            // 如果 JS 没显式传 Cookie，自动带上 WebView 容器保存的 Cookie
             if (!hasCookie) {
                 String cookie = CookieManager.getInstance().getCookie(urlStr);
                 if (!TextUtils.isEmpty(cookie)) {
@@ -296,7 +302,7 @@ public class WebHome extends Spider {
         return res.toString();
     }
 
-    // ================= Native 资源抓取 (拦截 shouldInterceptRequest 图片请求) =================
+    // ================= 图片资源排队与流控制 =================
 
     private static class WebResourceData {
         int code = 200;
@@ -306,19 +312,53 @@ public class WebHome extends Spider {
         InputStream stream;
     }
 
+    // 自动在流关闭时释放信号量的包装 InputStream
+    private static class SemaphoreInputStream extends FilterInputStream {
+        private final Semaphore semaphore;
+        private boolean released = false;
+
+        protected SemaphoreInputStream(InputStream in, Semaphore semaphore) {
+            super(in);
+            this.semaphore = semaphore;
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                super.close();
+            } finally {
+                release();
+            }
+        }
+
+        private synchronized void release() {
+            if (!released) {
+                released = true;
+                if (semaphore != null) {
+                    semaphore.release();
+                }
+            }
+        }
+    }
+
     private static WebResourceData fetchResourceData(Uri uri, String extraRange) {
         if (uri == null) return null;
         String targetUrl = uri.getQueryParameter("url");
         if (TextUtils.isEmpty(targetUrl)) return null;
 
         String headersJson = uri.getQueryParameter("headers");
+        boolean acquired = false;
 
         try {
+            // 排队获取信号量，最多等待 10 秒
+            acquired = IMAGE_SEMAPHORE.tryAcquire(10, TimeUnit.SECONDS);
+            if (!acquired) return null;
+
             URL url = new URL(targetUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(15000);
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
             conn.setInstanceFollowRedirects(true);
             conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
 
@@ -331,7 +371,6 @@ public class WebHome extends Spider {
                     while (keys.hasNext()) {
                         String key = keys.next();
                         String value = jsonObj.optString(key, "");
-                        // 即使 value 是空字符串（比如 Referer: ""），也正常设置
                         conn.setRequestProperty(key, value);
                         if ("user-agent".equalsIgnoreCase(key)) hasUA = true;
                     }
@@ -357,7 +396,10 @@ public class WebHome extends Spider {
             String responseMessage = conn.getResponseMessage();
 
             InputStream is = (responseCode >= 400) ? conn.getErrorStream() : conn.getInputStream();
-            if (is == null) return null;
+            if (is == null) {
+                if (acquired) IMAGE_SEMAPHORE.release();
+                return null;
+            }
 
             String encoding = conn.getContentEncoding();
             if (encoding != null) {
@@ -373,10 +415,15 @@ public class WebHome extends Spider {
             data.message = TextUtils.isEmpty(responseMessage) ? "OK" : responseMessage;
             data.contentType = conn.getContentType() != null ? conn.getContentType() : "image/*";
             data.contentRange = conn.getHeaderField("Content-Range");
-            data.stream = is;
+            // 将输入流包装，WebView 读取完毕或关闭流时会自动释放信号量
+            data.stream = new SemaphoreInputStream(is, IMAGE_SEMAPHORE);
 
             return data;
+
         } catch (Throwable t) {
+            if (acquired) {
+                IMAGE_SEMAPHORE.release();
+            }
             android.util.Log.e("WebHome", "fetchResourceData error", t);
         }
         return null;
@@ -387,7 +434,7 @@ public class WebHome extends Spider {
     public static class NativeBridge {
         @JavascriptInterface
         public void asyncReq(final String reqId, final String url, final String options) {
-            // 扔进线程池异步处理，不阻塞 JS 线程
+            // 扔进线程池异步执行，绝不卡死 WebView JS 主线程
             HTTP_EXECUTOR.execute(new Runnable() {
                 @Override
                 public void run() {
@@ -426,7 +473,7 @@ public class WebHome extends Spider {
         }
     }
 
-    // ================= Overlay =================
+    // ================= Overlay UI 容器 =================
 
     private static final class Overlay extends Dialog {
         private final Activity host;
@@ -639,7 +686,7 @@ public class WebHome extends Spider {
         private void injectSdk(WebView v) {
             try {
                 String js = FmSdk.get("normal", false);
-                // 彻底解决阻塞卡死的 纯异步 Promise 桥接脚本
+                // 彻底解决同步阻塞卡死的 纯异步 Promise 桥接脚本
                 String reqPolyfill = "if(window.fm && !window.fm._patched){" +
                         "window.fm._patched=true;" +
                         "window.fm._reqCallbacks={};" +
