@@ -7,6 +7,8 @@ import android.text.TextUtils;
 import android.util.Base64;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 
 import org.json.JSONException;
@@ -28,10 +30,10 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
 /**
- * FmBridge — 完整的 fongmiBridge 实现 + SDK JS 注入。
+ * FmBridge — fongmiBridge JS 接口 + 资源拦截。
  *
- * <p>这里把 webhtv 的 HomeWebController.getSdk() 那段 JS 字符串原样保留，
- * 所有 method 都有真实的 Java 实现。
+ * <p>关键的图片防盗链靠 {@link #intercept(WebView, WebResourceRequest)} 在
+ * shouldInterceptRequest 里直接代理资源请求, 不依赖壳的 NanoHTTPD.
  */
 public class FmBridge {
 
@@ -52,7 +54,149 @@ public class FmBridge {
         this.handler = handler != null ? handler : new DefaultFmActionHandler(this.appContext);
     }
 
-    // ============== JS 接口 (来自 webhtv) ==============
+    // ============== 资源拦截 - 关键! 解决图片防盗链 ==============
+
+    /**
+     * 拦截 WebView 加载的图片/视频/CSS 资源, 加上必要的 Referer/UA 后代理取.
+     * 同步阻塞 (WebView client 是工作线程, 直接跑 OkHttp 没问题).
+     */
+    public WebResourceResponse intercept(WebView view, WebResourceRequest request) {
+        if (request == null) return null;
+        String url = request.getUrl().toString();
+        if (TextUtils.isEmpty(url)) return null;
+        // 拦截的 url 通常是 cdn / 图床 等外链
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
+        // 不拦截 data: blob: 等
+        if (url.startsWith("data:") || url.startsWith("blob:")) return null;
+
+        // 拿 site header 当作默认 Referer
+        String referer = null;
+        String userAgent = null;
+        if (handler != null) {
+            try {
+                org.json.JSONObject siteInfo = handler.siteInfo();
+                if (siteInfo != null) {
+                    org.json.JSONObject h = siteInfo.optJSONObject("header");
+                    if (h != null) {
+                        referer = h.optString("Referer", h.optString("referer", null));
+                        userAgent = h.optString("User-Agent", h.optString("user-agent", null));
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        try {
+            return doIntercept(url, request, referer, userAgent);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 老 API 兼容: shouldOverrideUrlLoading 调用 */
+    public WebResourceResponse intercept(String url) {
+        if (TextUtils.isEmpty(url)) return null;
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return null;
+        try {
+            return doIntercept(url, null, null, null);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private WebResourceResponse doIntercept(String url, WebResourceRequest request, String referer, String userAgent) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(30000);
+            conn.setInstanceFollowRedirects(true);
+            // 默认 UA — 仿手机
+            if (TextUtils.isEmpty(userAgent)) {
+                userAgent = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36";
+            }
+            conn.setRequestProperty("User-Agent", userAgent);
+            conn.setRequestProperty("Accept", "*/*");
+            conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
+            conn.setRequestProperty("Connection", "keep-alive");
+
+            // 防盗链: 用 site 的 header (referer)
+            if (!TextUtils.isEmpty(referer)) {
+                conn.setRequestProperty("Referer", referer);
+            }
+
+            // 透传原始请求的 Range (图片分段 / 视频 Range 必需)
+            if (request != null) {
+                String range = request.getRequestHeaders().get("Range");
+                if (!TextUtils.isEmpty(range)) {
+                    conn.setRequestProperty("Range", range);
+                }
+            }
+
+            // 写 cookie
+            try {
+                String cookie = CookieManager.getInstance().getCookie(url);
+                if (!TextUtils.isEmpty(cookie)) conn.setRequestProperty("Cookie", cookie);
+            } catch (Throwable ignored) {}
+
+            int code = conn.getResponseCode();
+            String encoding = conn.getContentEncoding();
+            InputStream is = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+            if (is == null) return null;
+            byte[] raw = readAll(is, encoding);
+
+            String mime = guessMimeType(url, conn.getContentType());
+            String encoding_header = mime.startsWith("text/") || mime.contains("javascript") || mime.contains("json")
+                    ? "utf-8" : null;
+            int status = code >= 400 ? code : 200;
+            String reason = code >= 400 ? "HTTP " + code : "OK";
+
+            return new WebResourceResponse(mime, encoding_header, status, reason,
+                    conn.getHeaderFields(), new java.io.ByteArrayInputStream(raw));
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private String guessMimeType(String url, String contentType) {
+        if (!TextUtils.isEmpty(contentType)) return contentType;
+        String lower = url.toLowerCase();
+        if (lower.contains(".jpg") || lower.contains(".jpeg")) return "image/jpeg";
+        if (lower.contains(".png")) return "image/png";
+        if (lower.contains(".gif")) return "image/gif";
+        if (lower.contains(".webp")) return "image/webp";
+        if (lower.contains(".svg")) return "image/svg+xml";
+        if (lower.contains(".ico")) return "image/x-icon";
+        if (lower.contains(".m3u8")) return "application/x-mpegURL";
+        if (lower.contains(".mp4")) return "video/mp4";
+        if (lower.contains(".ts")) return "video/mp2t";
+        if (lower.contains(".webm")) return "video/webm";
+        if (lower.contains(".mp3")) return "audio/mpeg";
+        if (lower.contains(".m4a") || lower.contains(".aac")) return "audio/aac";
+        if (lower.contains(".css")) return "text/css";
+        if (lower.contains(".js")) return "application/javascript";
+        if (lower.contains(".json")) return "application/json";
+        if (lower.contains(".woff") || lower.contains(".woff2")) return "font/woff2";
+        if (lower.contains(".ttf")) return "font/ttf";
+        return "application/octet-stream";
+    }
+
+    private static byte[] readAll(InputStream in, String encoding) throws IOException {
+        if (in == null) return new byte[0];
+        try {
+            if ("gzip".equalsIgnoreCase(encoding)) in = new GZIPInputStream(in);
+            else if ("deflate".equalsIgnoreCase(encoding)) in = new InflaterInputStream(in);
+        } catch (IOException ignored) {}
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        in.close();
+        return out.toByteArray();
+    }
+
+    // ============== JS 接口 ==============
 
     @JavascriptInterface
     public void invoke(String requestId, String method, String payload) {
@@ -128,7 +272,7 @@ public class FmBridge {
         }
     }
 
-    // ============== method dispatch (来自 webhtv HomeWebBridge.handle) ==============
+    // ============== method dispatch ==============
 
     private String handle(String method, JSONObject payload) {
         if (handler == null) return "{}";
@@ -204,7 +348,6 @@ public class FmBridge {
         return out.toString();
     }
 
-    /** 同步 HTTP — OkHttp 等价实现 */
     private FmHttpResponse doHttp(String url, String method, JSONObject headers, String body,
                                   String responseType, int timeout, boolean includeCookie) {
         if (TextUtils.isEmpty(url)) return new FmHttpResponse(0, "", null, null, "empty url");
@@ -264,20 +407,6 @@ public class FmBridge {
         } finally {
             if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
         }
-    }
-
-    private static byte[] readAll(InputStream in, String encoding) throws IOException {
-        if (in == null) return new byte[0];
-        try {
-            if ("gzip".equalsIgnoreCase(encoding)) in = new GZIPInputStream(in);
-            else if ("deflate".equalsIgnoreCase(encoding)) in = new InflaterInputStream(in);
-        } catch (IOException ignored) {}
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buf = new byte[8192];
-        int n;
-        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-        in.close();
-        return out.toByteArray();
     }
 
     // ============== resolve / reject ==============

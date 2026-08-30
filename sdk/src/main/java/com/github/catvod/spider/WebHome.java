@@ -325,7 +325,8 @@ public class WebHome extends Spider {
             } catch (Throwable ignored) {}
 
             FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler(getContext());
-            v.addJavascriptInterface(new FmBridge(v, h), "fongmiBridge");
+            final FmBridge bridge = new FmBridge(v, h);
+            v.addJavascriptInterface(bridge, "fongmiBridge");
             v.setWebChromeClient(new WebChromeClient());
             v.setWebViewClient(new WebViewClient() {
                 @Override
@@ -337,6 +338,18 @@ public class WebHome extends Spider {
                 public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                     if (req == null || req.getUrl() == null) return true;
                     return handleUrl(view, req.getUrl().toString());
+                }
+
+                // 关键: 拦截资源请求, 由 SDK 自己代理 (处理图片防盗链)
+                @Override
+                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, String url) {
+                    return bridge.intercept(url);
+                }
+
+                @Override
+                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                    if (req == null || req.getUrl() == null) return null;
+                    return bridge.intercept(view, req);
                 }
 
                 @Override
