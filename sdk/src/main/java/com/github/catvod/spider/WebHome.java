@@ -67,6 +67,24 @@ public class WebHome extends Spider {
     private static final Set<String> REFRESHING = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     /*
+     * 域名线路记忆：首次遇到某图片域名时先走代理兑底，
+     * 同时后台探测该域名能否直连；探测通过则后续同域名
+     * 图片直接返回原图 URL，交给 WebView 原生加载
+     * （Chromium 自带 HTTP/2、连接复用和磁盘缓存，比 Java 代理快）。
+     */
+    private static final int ROUTE_UNKNOWN = 0;
+    private static final int ROUTE_DIRECT = 1;
+    private static final int ROUTE_PROXY = 2;
+    private static final long ROUTE_TTL_MILLIS = 30 * 60 * 1000L;
+    private static final ConcurrentHashMap<String, DomainRoute> DOMAIN_ROUTES = new ConcurrentHashMap<>();
+    private static final Set<String> PROBING = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    private static final class DomainRoute {
+        volatile int mode = ROUTE_UNKNOWN;
+        volatile long checkedAt;
+    }
+
+    /*
      * 内存图片缓存：图片首次由 WebView 拉取时边转发边收集字节，
      * 读完异步入缓存；下次同图直接内存秒回，不再走网络。
      */
@@ -369,6 +387,94 @@ public class WebHome extends Spider {
             }
         }
         return res.toString();
+    }
+
+    /* ================= 域名直连探测与线路记忆 ================= */
+
+    private static String hostOf(String url) {
+        try {
+            return new URL(url).getHost();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static DomainRoute routeFor(String host) {
+        DomainRoute r = DOMAIN_ROUTES.get(host);
+        if (r == null) {
+            r = new DomainRoute();
+            DomainRoute old = DOMAIN_ROUTES.putIfAbsent(host, r);
+            if (old != null) r = old;
+        }
+        return r;
+    }
+
+    /*
+     * 后台探测某图片域名能否直连（不带 Referer/Cookie 的裸请求）：
+     * 200 + image/* 视为可直连，其它一律保持代理线路。
+     * 每个域名同时只探一次，结果带 TTL，过期后下次请求会重测。
+     */
+    private static void probeDirect(final String host, final String sampleUrl) {
+        if (TextUtils.isEmpty(host) || TextUtils.isEmpty(sampleUrl)) return;
+        if (!PROBING.add(host)) return;
+        HTTP_EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                HttpURLConnection conn = null;
+                try {
+                    conn = (HttpURLConnection) new URL(sampleUrl).openConnection();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(8000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setUseCaches(false);
+                    conn.setRequestProperty("Accept", "image/*,*/*;q=0.8");
+                    conn.setRequestProperty("Accept-Encoding", "identity");
+                    conn.setRequestProperty("User-Agent", defaultUA());
+                    int code = conn.getResponseCode();
+                    String type = conn.getContentType();
+                    boolean ok = code == 200 && type != null && type.toLowerCase().startsWith("image/");
+                    DomainRoute r = routeFor(host);
+                    synchronized (r) {
+                        if (r.mode == ROUTE_UNKNOWN) {
+                            r.mode = ok ? ROUTE_DIRECT : ROUTE_PROXY;
+                            r.checkedAt = System.currentTimeMillis();
+                        }
+                    }
+                    android.util.Log.d("WebHome", "probeDirect " + host + " -> " + (ok ? "DIRECT" : "PROXY") + " code=" + code);
+                } catch (Throwable t) {
+                    DomainRoute r = routeFor(host);
+                    synchronized (r) {
+                        if (r.mode == ROUTE_UNKNOWN) {
+                            r.mode = ROUTE_PROXY;
+                            r.checkedAt = System.currentTimeMillis();
+                        }
+                    }
+                } finally {
+                    PROBING.remove(host);
+                    if (conn != null) {
+                        try {
+                            conn.disconnect();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    private static boolean needsCriticalHeader(JSONObject headers) {
+        if (headers == null) return false;
+        try {
+            Iterator<String> keys = headers.keys();
+            while (keys.hasNext()) {
+                String k = keys.next();
+                if ("referer".equalsIgnoreCase(k) || "cookie".equalsIgnoreCase(k)
+                        || "user-agent".equalsIgnoreCase(k) || "authorization".equalsIgnoreCase(k)) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     // ================= fm.res 资源代理 =================
@@ -774,16 +880,59 @@ public class WebHome extends Spider {
         @JavascriptInterface
         public String res(String url, String options) {
             try {
+                JSONObject opt = TextUtils.isEmpty(options) ? new JSONObject() : new JSONObject(options);
+                JSONObject headers = opt.optJSONObject("headers");
+
+                /*
+                 * 线路分流：需要自定义防盗链头(Referer/Cookie/UA)的域名
+                 * 只能走代理；其余域名第一次走代理兑底并触发后台探测，
+                 * 探测通过后同域名图片直接返回原图 URL（直连线路）。
+                 */
+                if (!TextUtils.isEmpty(url) && (url.startsWith("http://") || url.startsWith("https://"))
+                        && (headers == null || !needsCriticalHeader(headers))) {
+                    String host = hostOf(url);
+                    if (!TextUtils.isEmpty(host)) {
+                        DomainRoute r = routeFor(host);
+                        int mode;
+                        synchronized (r) {
+                            if (r.mode != ROUTE_UNKNOWN && System.currentTimeMillis() - r.checkedAt > ROUTE_TTL_MILLIS) {
+                                r.mode = ROUTE_UNKNOWN; /* 线路记忆过期，重测 */
+                            }
+                            mode = r.mode;
+                        }
+                        if (mode == ROUTE_UNKNOWN) probeDirect(host, url);
+                        if (mode == ROUTE_DIRECT) return url;
+                    }
+                }
+
                 String encodedUrl = URLEncoder.encode(url, "UTF-8");
                 String encodedHeaders = "";
-                if (!TextUtils.isEmpty(options)) {
-                    JSONObject opt = new JSONObject(options);
-                    JSONObject headers = opt.optJSONObject("headers");
-                    if (headers != null) encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
-                }
+                if (headers != null) encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
                 return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
             } catch (Throwable t) {
                 return url;
+            }
+        }
+
+        /*
+         * JS 错误回退：直连图挂了(防盗链/网络波动)时由页面 img error
+         * 事件调到这里，把该域名记回代理线路，并当场返回代理 URL 让 JS 换 src。
+         */
+        @JavascriptInterface
+        public String directFailed(String host, String url) {
+            try {
+                if (TextUtils.isEmpty(host)) host = hostOf(url);
+                if (!TextUtils.isEmpty(host)) {
+                    DomainRoute r = routeFor(host);
+                    synchronized (r) {
+                        r.mode = ROUTE_PROXY;
+                        r.checkedAt = System.currentTimeMillis();
+                    }
+                }
+                if (TextUtils.isEmpty(url)) return "";
+                return "http://127.0.0.1:9978/webResource?url=" + URLEncoder.encode(url, "UTF-8");
+            } catch (Throwable t) {
+                return url == null ? "" : url;
             }
         }
     }
@@ -1027,7 +1176,18 @@ public class WebHome extends Spider {
                         "window.fm.res=function(u,o){try{return _nativeBridge.res(u,JSON.stringify(o||{}));}catch(e){return u;}};" +
                         "}";
 
-                v.evaluateJavascript(js + "\n" + reqPolyfill, null);
+                String routeHook = "if(!window.__whRouteHooked){window.__whRouteHooked=true;" +
+                        "document.addEventListener('error',function(ev){" +
+                        "var el=ev.target;if(!el||el.tagName!=='IMG')return;" +
+                        "var src=el.src||'';" +
+                        "if(!src||src.indexOf('/webResource')!==-1||src.indexOf('data:')===0)return;" +
+                        "if(src.indexOf('http://')!==0&&src.indexOf('https://')!==0)return;" +
+                        "var m=src.match(/^(?:https?:)?\\/\\/([^\\/#?]+)/);" +
+                        "if(!m)return;" +
+                        "try{var proxy=_nativeBridge.directFailed(m[1],src);if(proxy){el.src=proxy;}}catch(e){}" +
+                        "},true);}";
+
+                v.evaluateJavascript(js + "\n" + reqPolyfill + "\n" + routeHook, null);
             } catch (Throwable t) {
                 android.util.Log.e("WebHome", "injectSdk failed", t);
             }
