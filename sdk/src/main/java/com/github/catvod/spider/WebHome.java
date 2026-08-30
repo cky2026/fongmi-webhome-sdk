@@ -42,6 +42,8 @@ import java.net.URLEncoder;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
@@ -54,6 +56,9 @@ public class WebHome extends Spider {
     private static volatile WeakReference<Activity> foreground = new WeakReference<>(null);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
+
+    // 引入后台线程池，防止网络请求卡死 WebView JS 主线程
+    private static final ExecutorService HTTP_EXECUTOR = Executors.newFixedThreadPool(12);
 
     private static volatile FmActionHandler globalHandler;
     private String extend = "";
@@ -203,7 +208,7 @@ public class WebHome extends Spider {
         return trim;
     }
 
-    // ================= Native 网络请求实现 (含 GZIP 解压与 Cookie) =================
+    // ================= Native 异步网络请求实现 =================
 
     public static String doNativeReq(String urlStr, String optJson) {
         JSONObject res = new JSONObject();
@@ -223,22 +228,26 @@ public class WebHome extends Spider {
             conn.setRequestProperty("Accept-Encoding", "gzip, deflate");
 
             boolean hasUA = false;
+            boolean hasCookie = false;
+
             if (headers != null) {
                 Iterator<String> keys = headers.keys();
                 while (keys.hasNext()) {
                     String k = keys.next();
-                    String v = headers.optString(k);
-                    if (!TextUtils.isEmpty(v)) {
-                        conn.setRequestProperty(k, v);
-                        if ("user-agent".equalsIgnoreCase(k)) hasUA = true;
-                    }
+                    String v = headers.optString(k, "");
+                    // 允许传递空值 (如 Referer: "")
+                    conn.setRequestProperty(k, v);
+                    if ("user-agent".equalsIgnoreCase(k)) hasUA = true;
+                    if ("cookie".equalsIgnoreCase(k) && !TextUtils.isEmpty(v)) hasCookie = true;
                 }
             }
 
-            // 带上 WebView 的 Cookie
-            String cookie = CookieManager.getInstance().getCookie(urlStr);
-            if (!TextUtils.isEmpty(cookie)) {
-                conn.setRequestProperty("Cookie", cookie);
+            // 如果 JS 没显式传 Cookie，自动带上 WebView 容器保存的 Cookie
+            if (!hasCookie) {
+                String cookie = CookieManager.getInstance().getCookie(urlStr);
+                if (!TextUtils.isEmpty(cookie)) {
+                    conn.setRequestProperty("Cookie", cookie);
+                }
             }
 
             if (!hasUA) {
@@ -287,7 +296,7 @@ public class WebHome extends Spider {
         return res.toString();
     }
 
-    // ================= Native 资源拦截抓取 (专供 shouldInterceptRequest 图片处理) =================
+    // ================= Native 资源抓取 (拦截 shouldInterceptRequest 图片请求) =================
 
     private static class WebResourceData {
         int code = 200;
@@ -303,7 +312,6 @@ public class WebHome extends Spider {
         if (TextUtils.isEmpty(targetUrl)) return null;
 
         String headersJson = uri.getQueryParameter("headers");
-        String credentials = uri.getQueryParameter("credentials");
 
         try {
             URL url = new URL(targetUrl);
@@ -322,11 +330,10 @@ public class WebHome extends Spider {
                     Iterator<String> keys = jsonObj.keys();
                     while (keys.hasNext()) {
                         String key = keys.next();
-                        String value = jsonObj.getString(key);
-                        if (!TextUtils.isEmpty(value)) {
-                            conn.setRequestProperty(key, value);
-                            if ("user-agent".equalsIgnoreCase(key)) hasUA = true;
-                        }
+                        String value = jsonObj.optString(key, "");
+                        // 即使 value 是空字符串（比如 Referer: ""），也正常设置
+                        conn.setRequestProperty(key, value);
+                        if ("user-agent".equalsIgnoreCase(key)) hasUA = true;
                     }
                 } catch (Throwable ignored) {}
             }
@@ -335,11 +342,9 @@ public class WebHome extends Spider {
                 conn.setRequestProperty("Range", extraRange);
             }
 
-            if ("include".equals(credentials) || TextUtils.isEmpty(credentials)) {
-                String cookie = CookieManager.getInstance().getCookie(targetUrl);
-                if (!TextUtils.isEmpty(cookie)) {
-                    conn.setRequestProperty("Cookie", cookie);
-                }
+            String cookie = CookieManager.getInstance().getCookie(targetUrl);
+            if (!TextUtils.isEmpty(cookie)) {
+                conn.setRequestProperty("Cookie", cookie);
             }
 
             if (!hasUA) {
@@ -381,8 +386,25 @@ public class WebHome extends Spider {
 
     public static class NativeBridge {
         @JavascriptInterface
-        public String req(String url, String options) {
-            return doNativeReq(url, options);
+        public void asyncReq(final String reqId, final String url, final String options) {
+            // 扔进线程池异步处理，不阻塞 JS 线程
+            HTTP_EXECUTOR.execute(new Runnable() {
+                @Override
+                public void run() {
+                    final String resultJson = doNativeReq(url, options);
+                    MAIN.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (overlay != null && overlay.web != null) {
+                                String js = "if(window.fm&&window.fm._onReqResult){window.fm._onReqResult("
+                                        + JSONObject.quote(reqId) + ","
+                                        + JSONObject.quote(resultJson) + ");}";
+                                overlay.web.evaluateJavascript(js, null);
+                            }
+                        }
+                    });
+                }
+            });
         }
 
         @JavascriptInterface
@@ -397,7 +419,6 @@ public class WebHome extends Spider {
                         encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
                     }
                 }
-                // 返回本地网关链接，该链接会被下面的 shouldInterceptRequest 拦截处理
                 return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
             } catch (Throwable t) {
                 return url;
@@ -537,7 +558,6 @@ public class WebHome extends Spider {
                     return handleUrl(view, req.getUrl().toString());
                 }
 
-                // 拦截 /webResource 请求（拦截所有 fm.res 代理的防盗链图片）
                 @Override
                 public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
                     if (url != null && url.contains("/webResource")) {
@@ -619,17 +639,29 @@ public class WebHome extends Spider {
         private void injectSdk(WebView v) {
             try {
                 String js = FmSdk.get("normal", false);
+                // 彻底解决阻塞卡死的 纯异步 Promise 桥接脚本
                 String reqPolyfill = "if(window.fm && !window.fm._patched){" +
                         "window.fm._patched=true;" +
+                        "window.fm._reqCallbacks={};" +
+                        "window.fm._reqSeq=0;" +
                         "window.fm.req=function(u,o){return new Promise(function(resolve){" +
-                        "  try{" +
-                        "    var res=JSON.parse(_nativeBridge.req(u, JSON.stringify(o||{})));" +
+                        "  var id='req_'+(++window.fm._reqSeq)+'_'+Date.now();" +
+                        "  window.fm._reqCallbacks[id]=function(res){" +
                         "    if(o && o.responseType==='json' && typeof res.body==='string'){" +
                         "      try{ res.body=JSON.parse(res.body); }catch(e){}" +
                         "    }" +
                         "    resolve(res);" +
-                        "  }catch(e){ resolve({ok:false, status:0, error:e.message}); }" +
+                        "  };" +
+                        "  try{ _nativeBridge.asyncReq(id, u, JSON.stringify(o||{})); }" +
+                        "  catch(e){ delete window.fm._reqCallbacks[id]; resolve({ok:false, status:0, error:e.message}); }" +
                         "});};" +
+                        "window.fm._onReqResult=function(id, resJsonStr){" +
+                        "  var cb=window.fm._reqCallbacks[id];" +
+                        "  if(cb){" +
+                        "    delete window.fm._reqCallbacks[id];" +
+                        "    try{ cb(JSON.parse(resJsonStr)); }catch(e){ cb({ok:false, status:0, error:e.message}); }" +
+                        "  }" +
+                        "};" +
                         "window.fm.res=function(u,o){" +
                         "  try{ return _nativeBridge.res(u, JSON.stringify(o||{})); }catch(e){ return u; }" +
                         "};" +
