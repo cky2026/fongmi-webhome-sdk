@@ -217,6 +217,7 @@ public class WebHome extends Spider {
         private final String source;
         private final String sourceKey;
         private WebView web;
+        private FmBridge bridge;
 
         Overlay(Activity activity, String source, String sourceKey) {
             super(activity, 0x0103000a);
@@ -325,7 +326,7 @@ public class WebHome extends Spider {
             } catch (Throwable ignored) {}
 
             FmActionHandler h = globalHandler != null ? globalHandler : new DefaultFmActionHandler(getContext());
-            final FmBridge bridge = new FmBridge(v, h);
+            bridge = new FmBridge(v, h);
             v.addJavascriptInterface(bridge, "fongmiBridge");
             v.setWebChromeClient(new WebChromeClient());
             v.setWebViewClient(new WebViewClient() {
