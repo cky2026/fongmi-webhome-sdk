@@ -610,7 +610,7 @@ public class WebHome extends Spider {
         }
     }
 
-    private static boolean needsCriticalHeader(Map<String, String> headers) {
+    private static boolean hasCriticalHeader(Map<String, String> headers) {
         if (headers == null || headers.isEmpty()) return false;
         for (String k : headers.keySet()) {
             String lk = k.toLowerCase();
@@ -626,7 +626,7 @@ public class WebHome extends Spider {
      * Referer/UA/Authorization 无法附加在 <img> 直连请求上，仍必须走代理；
      * Cookie 已通过 syncCookie 落到 CookieManager，不再是关键头。
      */
-    private static boolean needsCriticalHeader(JSONObject headers) {
+    private static boolean hasCriticalHeader(JSONObject headers) {
         if (headers == null) return false;
         try {
             Iterator<String> keys = headers.keys();
@@ -1056,7 +1056,7 @@ public class WebHome extends Spider {
              * 直接返回原图 URL，由 WebView 原生加载（最快）。
              */
             if (!TextUtils.isEmpty(url) && (url.startsWith("http://") || url.startsWith("https://"))
-                    && (headers == null || !needsCriticalHeader(headers))) {
+                    && (headers == null || !hasCriticalHeader(headers))) {
                 String host = hostOf(url);
                 if (!TextUtils.isEmpty(host)) {
                     if (decideRoute(host, url) == ROUTE_DIRECT) return url;
