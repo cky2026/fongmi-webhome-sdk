@@ -76,6 +76,14 @@ public class WebHome extends Spider {
     private static final int ROUTE_DIRECT = 1;
     private static final int ROUTE_PROXY = 2;
     private static final long ROUTE_TTL_MILLIS = 30 * 60 * 1000L;
+    /*
+     * 探测超时与等待上限：健康 CDN 几百毫秒内出结果；
+     * JS 侧最多只等 PROBE_MAX_WAIT，超时立刻走代理兑底，
+     * 探测继续在后台跑完，结果对后续请求生效。
+     */
+    private static final int PROBE_CONNECT_TIMEOUT = 1000;
+    private static final int PROBE_READ_TIMEOUT = 2500;
+    private static final long PROBE_MAX_WAIT_MILLIS = 2000L;
     private static final ConcurrentHashMap<String, DomainRoute> DOMAIN_ROUTES = new ConcurrentHashMap<>();
 
     private static final class DomainRoute {
@@ -417,15 +425,18 @@ public class WebHome extends Spider {
     private static int decideRoute(final String host, final String sampleUrl, final String headersJson) {
         DomainRoute r = routeFor(host);
         synchronized (r) {
-            while (true) {
-                if (r.mode == ROUTE_UNKNOWN) {
-                    if (!r.probing) {
-                        r.probing = true;
+            if (r.mode != ROUTE_UNKNOWN && System.currentTimeMillis() - r.checkedAt > ROUTE_TTL_MILLIS) {
+                r.mode = ROUTE_UNKNOWN; /* 线路记忆过期，重测 */
+            }
+            if (r.mode != ROUTE_UNKNOWN) return r.mode;
+
+            if (!r.probing) {
+                r.probing = true;
                         final DomainRoute fr = r;
                         final String fHost = host;
                         final String fUrl = sampleUrl;
                         final String fHj = headersJson;
-                        HTTP_EXECUTOR.execute(new Runnable() {
+                        Runnable probeTask = new Runnable() {
                             @Override
                             public void run() {
                                 int mode = ROUTE_PROXY;
@@ -433,8 +444,8 @@ public class WebHome extends Spider {
                                 try {
                                     conn = (HttpURLConnection) new URL(fUrl).openConnection();
                                     conn.setRequestMethod("GET");
-                                    conn.setConnectTimeout(3000);
-                                    conn.setReadTimeout(3000);
+                                    conn.setConnectTimeout(PROBE_CONNECT_TIMEOUT);
+                                    conn.setReadTimeout(PROBE_READ_TIMEOUT);
                                     conn.setInstanceFollowRedirects(true);
                                     conn.setUseCaches(false);
                                     conn.setRequestProperty("Accept", "image/*,*/*;q=0.8");
@@ -481,21 +492,33 @@ public class WebHome extends Spider {
                                     fr.notifyAll();
                                 }
                             }
-                        });
-                    }
-                    try {
-                        r.wait(7000);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return ROUTE_PROXY;
-                    }
-                } else if (System.currentTimeMillis() - r.checkedAt > ROUTE_TTL_MILLIS) {
-                    /* 线路记忆过期，重测 */
-                    r.mode = ROUTE_UNKNOWN;
-                } else {
-                    return r.mode;
+                        };
+                        try {
+                            HTTP_EXECUTOR.execute(probeTask);
+                        } catch (Throwable t) {
+                            /* 线程池拒绝等异常：立即判 PROXY，不阻塞 JS */
+                            r.mode = ROUTE_PROXY;
+                            r.checkedAt = System.currentTimeMillis();
+                            r.probing = false;
+                        }
+            }
+
+            /*
+             * 只等有限时间：探测出了结果就用决策；
+             * 超时先走代理兑底，本次请求不再干等。
+             */
+            long deadline = System.currentTimeMillis() + PROBE_MAX_WAIT_MILLIS;
+            while (r.mode == ROUTE_UNKNOWN && System.currentTimeMillis() < deadline) {
+                long remain = deadline - System.currentTimeMillis();
+                if (remain <= 0) break;
+                try {
+                    r.wait(remain);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
+            return r.mode == ROUTE_UNKNOWN ? ROUTE_PROXY : r.mode;
         }
     }
 
