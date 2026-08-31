@@ -131,7 +131,7 @@ public class WebHome extends Spider {
         if (httpCacheInstalled) return;
         try {
             /* 提高同主机 keep-alive 连接池上限，首页几十张海报可并行复用连接 */
-            System.setProperty("http.maxConnections", "24");
+            System.setProperty("http.maxConnections", "10");
             File dir = new File(context.getCacheDir(), "webhome_http_cache");
             if (!dir.exists()) dir.mkdirs();
             if (android.net.http.HttpResponseCache.getInstalled() == null) {
@@ -463,14 +463,32 @@ public class WebHome extends Spider {
         });
     }
 
+    /*
+     * 借鉴壳 CustomWebView.checkHeader 的思路：把 SDK 传来的 Cookie
+     * 同步进系统 CookieManager，这样带 Cookie 的图片域名也能走
+     * 直连线路（WebView 加载图片时会自动携带同域 Cookie）。
+     */
+    private static void syncCookie(String url, String cookie) {
+        try {
+            CookieManager cm = CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            cm.setCookie(url, cookie);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /*
+     * Referer/UA/Authorization 无法附加在 <img> 直连请求上，仍必须走代理；
+     * Cookie 已通过 syncCookie 落到 CookieManager，不再是关键头。
+     */
     private static boolean needsCriticalHeader(JSONObject headers) {
         if (headers == null) return false;
         try {
             Iterator<String> keys = headers.keys();
             while (keys.hasNext()) {
                 String k = keys.next();
-                if ("referer".equalsIgnoreCase(k) || "cookie".equalsIgnoreCase(k)
-                        || "user-agent".equalsIgnoreCase(k) || "authorization".equalsIgnoreCase(k)) return true;
+                if ("referer".equalsIgnoreCase(k) || "user-agent".equalsIgnoreCase(k)
+                        || "authorization".equalsIgnoreCase(k)) return true;
             }
         } catch (Throwable ignored) {
         }
@@ -883,6 +901,12 @@ public class WebHome extends Spider {
                 JSONObject opt = TextUtils.isEmpty(options) ? new JSONObject() : new JSONObject(options);
                 JSONObject headers = opt.optJSONObject("headers");
 
+                /* SDK 带了 Cookie 就同步进 CookieManager，为直连线路铺路 */
+                if (headers != null && !TextUtils.isEmpty(url)) {
+                    String ck = headers.optString("cookie", headers.optString("Cookie", ""));
+                    if (!TextUtils.isEmpty(ck)) syncCookie(url, ck);
+                }
+
                 /*
                  * 线路分流：需要自定义防盗链头(Referer/Cookie/UA)的域名
                  * 只能走代理；其余域名第一次走代理兑底并触发后台探测，
@@ -1110,7 +1134,11 @@ public class WebHome extends Spider {
 
         private WebResourceResponse handleWebResourceResponse(Uri uri, String range) {
             WebResourceData data = fetchResourceData(uri, range);
-            if (data == null) return null;
+            /*
+             * 借鉴壳 CustomWebView 的 empty 模式：失败时绝不能 return null，
+             * 否则 WebView 会真去请求 127.0.0.1:9978 等一个 404，白耗一个往返。
+             */
+            if (data == null) return emptyResponse();
 
             String mimeType = "application/octet-stream";
             String encoding = null;
@@ -1152,6 +1180,24 @@ public class WebHome extends Spider {
             }
 
             return new WebResourceResponse(mimeType, encoding, data.stream);
+        }
+
+        /*
+         * 立即返回的 404 空响应：拦截器内快速终结失败请求，
+         * 避免 WebView 落到真实 9978 服务器上等响应。
+         */
+        private WebResourceResponse emptyResponse() {
+            try {
+                if (Build.VERSION.SDK_INT >= 21) {
+                    Map<String, String> h = new HashMap<>();
+                    h.put("Access-Control-Allow-Origin", "*");
+                    h.put("Cache-Control", "no-store");
+                    return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", h, new ByteArrayInputStream(new byte[0]));
+                }
+                return new WebResourceResponse("text/plain", "utf-8", new ByteArrayInputStream(new byte[0]));
+            } catch (Throwable t) {
+                return null;
+            }
         }
 
         private void injectSdk(WebView v) {
