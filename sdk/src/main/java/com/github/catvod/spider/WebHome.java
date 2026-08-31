@@ -81,8 +81,8 @@ public class WebHome extends Spider {
      * JS 侧最多只等 PROBE_MAX_WAIT，超时立刻走代理兑底，
      * 探测继续在后台跑完，结果对后续请求生效。
      */
-    private static final int PROBE_CONNECT_TIMEOUT = 1000;
-    private static final int PROBE_READ_TIMEOUT = 2500;
+    private static final int PROBE_CONNECT_TIMEOUT = 600;
+    private static final int PROBE_READ_TIMEOUT = 1500;
     private static final long PROBE_MAX_WAIT_MILLIS = 2000L;
     private static final ConcurrentHashMap<String, DomainRoute> DOMAIN_ROUTES = new ConcurrentHashMap<>();
 
@@ -952,6 +952,46 @@ public class WebHome extends Spider {
         });
     }
 
+    /*
+     * 资源 URL 统一出口：直连/代理线路分流 + webResource 代理 URL 拼装。
+     * public static 供 FmBridge.resourceUrl 复用，保证 SDK 侧任何
+     * JS 路径生成的图片地址都走同一套路由决策，不再有绕过分流的漏网路径。
+     */
+    public static String resolveResourceUrl(String url, String options) {
+        try {
+            JSONObject opt = TextUtils.isEmpty(options) ? new JSONObject() : new JSONObject(options);
+            JSONObject headers = opt.optJSONObject("headers");
+
+            /* SDK 带了 Cookie 就同步进 CookieManager，为直连线路铺路 */
+            if (headers != null && !TextUtils.isEmpty(url)) {
+                String ck = headers.optString("cookie", headers.optString("Cookie", ""));
+                if (!TextUtils.isEmpty(ck)) syncCookie(url, ck);
+            }
+
+            /*
+             * 线路分流（先探测、后决策、全域名记忆）：
+             * 带 Referer/UA 等关键头的域名只能走代理（防盗链）；
+             * 其余域名首次同步探测，DIRECT 则后续整屏图片
+             * 直接返回原图 URL，由 WebView 原生加载（最快）。
+             */
+            if (!TextUtils.isEmpty(url) && (url.startsWith("http://") || url.startsWith("https://"))
+                    && (headers == null || !needsCriticalHeader(headers))) {
+                String host = hostOf(url);
+                if (!TextUtils.isEmpty(host)) {
+                    String hj = headers == null ? null : headers.toString();
+                    if (decideRoute(host, url, hj) == ROUTE_DIRECT) return url;
+                }
+            }
+
+            String encodedUrl = URLEncoder.encode(url, "UTF-8");
+            String encodedHeaders = "";
+            if (headers != null) encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
+            return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
+        } catch (Throwable t) {
+            return url;
+        }
+    }
+
     // ================= Native Bridge =================
 
     public static class NativeBridge {
@@ -976,38 +1016,7 @@ public class WebHome extends Spider {
 
         @JavascriptInterface
         public String res(String url, String options) {
-            try {
-                JSONObject opt = TextUtils.isEmpty(options) ? new JSONObject() : new JSONObject(options);
-                JSONObject headers = opt.optJSONObject("headers");
-
-                /* SDK 带了 Cookie 就同步进 CookieManager，为直连线路铺路 */
-                if (headers != null && !TextUtils.isEmpty(url)) {
-                    String ck = headers.optString("cookie", headers.optString("Cookie", ""));
-                    if (!TextUtils.isEmpty(ck)) syncCookie(url, ck);
-                }
-
-                /*
-                 * 线路分流（先探测、后决策、全域名记忆）：
-                 * 带 Referer/UA 等关键头的域名只能走代理（防盗链）；
-                 * 其余域名首次同步探测，DIRECT 则后续整屏图片
-                 * 直接返回原图 URL，由 WebView 原生加载（最快）。
-                 */
-                if (!TextUtils.isEmpty(url) && (url.startsWith("http://") || url.startsWith("https://"))
-                        && (headers == null || !needsCriticalHeader(headers))) {
-                    String host = hostOf(url);
-                    if (!TextUtils.isEmpty(host)) {
-                        String hj = headers == null ? null : headers.toString();
-                        if (decideRoute(host, url, hj) == ROUTE_DIRECT) return url;
-                    }
-                }
-
-                String encodedUrl = URLEncoder.encode(url, "UTF-8");
-                String encodedHeaders = "";
-                if (headers != null) encodedHeaders = "&headers=" + URLEncoder.encode(headers.toString(), "UTF-8");
-                return "http://127.0.0.1:9978/webResource?url=" + encodedUrl + encodedHeaders;
-            } catch (Throwable t) {
-                return url;
-            }
+            return resolveResourceUrl(url, options);
         }
 
         /*

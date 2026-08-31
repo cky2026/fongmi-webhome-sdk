@@ -85,21 +85,30 @@ public class FmBridge {
 
     @JavascriptInterface
     public String resourceUrl(String url, String options) {
+        /*
+         * 统一走 WebHome.resolveResourceUrl：直连/代理线路分流策略与
+         * NativeBridge.res 完全一致，SDK 侧 JS 生成的图片地址不再绕过
+         * 路由决策；异常时退回原始拼接逻辑兜底。
+         */
         try {
-            JSONObject opt = parseObject(options);
-            StringBuilder sb = new StringBuilder();
-            sb.append("http://127.0.0.1:9978/webResource?url=").append(encode(url));
-            if (opt.has("headers")) {
-                try {
-                    sb.append("&headers=").append(encode(opt.get("headers").toString()));
-                } catch (JSONException e) { /* ignore */ }
-            }
-            if ("include".equalsIgnoreCase(opt.optString("credentials"))) {
-                sb.append("&credentials=include");
-            }
-            return sb.toString();
+            return WebHome.resolveResourceUrl(url, options);
         } catch (Throwable t) {
-            return "http://127.0.0.1:9978/webResource?url=" + url;
+            try {
+                JSONObject opt = parseObject(options);
+                StringBuilder sb = new StringBuilder();
+                sb.append("http://127.0.0.1:9978/webResource?url=").append(encode(url));
+                if (opt.has("headers")) {
+                    try {
+                        sb.append("&headers=").append(encode(opt.get("headers").toString()));
+                    } catch (JSONException e) { /* ignore */ }
+                }
+                if ("include".equalsIgnoreCase(opt.optString("credentials"))) {
+                    sb.append("&credentials=include");
+                }
+                return sb.toString();
+            } catch (Throwable ignored) {
+                return "http://127.0.0.1:9978/webResource?url=" + url;
+            }
         }
     }
 
@@ -256,9 +265,9 @@ public class FmBridge {
             }
             return new FmHttpResponse(code, finalUrl, new String(raw, "UTF-8"), null, null);
         } catch (Throwable t) {
-            return new FmHttpResponse(0, url, null, null, t.getClass().getSimpleName() + ": " + t.getMessage());
-        } finally {
+            /* 失败时才断开连接；成功时不 disconnect，让 keep-alive 连接回池复用 */
             if (conn != null) try { conn.disconnect(); } catch (Throwable ignored) {}
+            return new FmHttpResponse(0, url, null, null, t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
@@ -271,7 +280,7 @@ public class FmBridge {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         int n;
-        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
         in.close();
         return out.toByteArray();
     }
@@ -280,6 +289,8 @@ public class FmBridge {
         if (value == null) value = "{}";
         if (value.length() > INLINE_LIMIT) {
             String resultId = "r_" + UUID.randomUUID().toString().replace("-", "");
+            /* 兜底防泄漏：JS 未调 clearResult 时防 Map 无限增长 */
+            if (results.size() > 32) results.clear();
             results.put(resultId, value);
             value = "{\"__fmResultId\":\"" + resultId + "\"}";
         }
