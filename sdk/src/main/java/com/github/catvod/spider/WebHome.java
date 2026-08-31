@@ -77,11 +77,11 @@ public class WebHome extends Spider {
     private static final int ROUTE_PROXY = 2;
     private static final long ROUTE_TTL_MILLIS = 30 * 60 * 1000L;
     private static final ConcurrentHashMap<String, DomainRoute> DOMAIN_ROUTES = new ConcurrentHashMap<>();
-    private static final Set<String> PROBING = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
     private static final class DomainRoute {
         volatile int mode = ROUTE_UNKNOWN;
         volatile long checkedAt;
+        volatile boolean probing;
     }
 
     /*
@@ -131,7 +131,7 @@ public class WebHome extends Spider {
         if (httpCacheInstalled) return;
         try {
             /* 提高同主机 keep-alive 连接池上限，首页几十张海报可并行复用连接 */
-            System.setProperty("http.maxConnections", "10");
+            System.setProperty("http.maxConnections", "24");
             File dir = new File(context.getCacheDir(), "webhome_http_cache");
             if (!dir.exists()) dir.mkdirs();
             if (android.net.http.HttpResponseCache.getInstalled() == null) {
@@ -410,57 +410,105 @@ public class WebHome extends Spider {
     }
 
     /*
-     * 后台探测某图片域名能否直连（不带 Referer/Cookie 的裸请求）：
-     * 200 + image/* 视为可直连，其它一律保持代理线路。
-     * 每个域名同时只探一次，结果带 TTL，过期后下次请求会重测。
+     * 同步短探测 + 全域名阻塞决策：首个图片触发探测（短超时），
+     * 同域名其它请求在同一把锁上等结果，整批图片一起拿到线路决策；
+     * 探测成功顺带把首图字节写进内存缓存（走代理兑底时也是秒回）。
      */
-    private static void probeDirect(final String host, final String sampleUrl) {
-        if (TextUtils.isEmpty(host) || TextUtils.isEmpty(sampleUrl)) return;
-        if (!PROBING.add(host)) return;
-        HTTP_EXECUTOR.execute(new Runnable() {
-            @Override
-            public void run() {
-                HttpURLConnection conn = null;
-                try {
-                    conn = (HttpURLConnection) new URL(sampleUrl).openConnection();
-                    conn.setRequestMethod("GET");
-                    conn.setConnectTimeout(5000);
-                    conn.setReadTimeout(8000);
-                    conn.setInstanceFollowRedirects(true);
-                    conn.setUseCaches(false);
-                    conn.setRequestProperty("Accept", "image/*,*/*;q=0.8");
-                    conn.setRequestProperty("Accept-Encoding", "identity");
-                    conn.setRequestProperty("User-Agent", defaultUA());
-                    int code = conn.getResponseCode();
-                    String type = conn.getContentType();
-                    boolean ok = code == 200 && type != null && type.toLowerCase().startsWith("image/");
-                    DomainRoute r = routeFor(host);
-                    synchronized (r) {
-                        if (r.mode == ROUTE_UNKNOWN) {
-                            r.mode = ok ? ROUTE_DIRECT : ROUTE_PROXY;
-                            r.checkedAt = System.currentTimeMillis();
-                        }
+    private static int decideRoute(final String host, final String sampleUrl, final String headersJson) {
+        DomainRoute r = routeFor(host);
+        synchronized (r) {
+            while (true) {
+                if (r.mode == ROUTE_UNKNOWN) {
+                    if (!r.probing) {
+                        r.probing = true;
+                        final DomainRoute fr = r;
+                        final String fHost = host;
+                        final String fUrl = sampleUrl;
+                        final String fHj = headersJson;
+                        HTTP_EXECUTOR.execute(new Runnable() {
+                            @Override
+                            public void run() {
+                                int mode = ROUTE_PROXY;
+                                HttpURLConnection conn = null;
+                                try {
+                                    conn = (HttpURLConnection) new URL(fUrl).openConnection();
+                                    conn.setRequestMethod("GET");
+                                    conn.setConnectTimeout(3000);
+                                    conn.setReadTimeout(3000);
+                                    conn.setInstanceFollowRedirects(true);
+                                    conn.setUseCaches(false);
+                                    conn.setRequestProperty("Accept", "image/*,*/*;q=0.8");
+                                    conn.setRequestProperty("Accept-Encoding", "identity");
+                                    conn.setRequestProperty("User-Agent", defaultUA());
+                                    int code = conn.getResponseCode();
+                                    String type = conn.getContentType();
+                                    boolean ok = code == 200 && type != null && type.toLowerCase().startsWith("image/");
+                                    android.util.Log.d("WebHome", "probeDirect " + fHost + " -> " + (ok ? "DIRECT" : "PROXY") + " code=" + code);
+                                    if (ok) {
+                                        mode = ROUTE_DIRECT;
+                                        InputStream is = conn.getInputStream();
+                                        if (is != null) {
+                                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                                            byte[] buf = new byte[8192];
+                                            int len;
+                                            while ((len = is.read(buf)) != -1) {
+                                                baos.write(buf, 0, len);
+                                                if (baos.size() > MAX_CACHE_ITEM_BYTES) break;
+                                            }
+                                            is.close();
+                                            byte[] bytes = baos.toByteArray();
+                                            if (bytes.length <= MAX_CACHE_ITEM_BYTES) {
+                                                putCache(cacheKey(fUrl, fHj), new CachedResource(bytes, type,
+                                                        safeHeader(conn, "ETag"), safeHeader(conn, "Last-Modified"),
+                                                        parseMaxAge(safeHeader(conn, "Cache-Control"))));
+                                            }
+                                        }
+                                    }
+                                } catch (Throwable t) {
+                                    mode = ROUTE_PROXY;
+                                } finally {
+                                    if (conn != null) {
+                                        try {
+                                            conn.disconnect();
+                                        } catch (Throwable ignored) {
+                                        }
+                                    }
+                                }
+                                synchronized (fr) {
+                                    fr.mode = mode;
+                                    fr.checkedAt = System.currentTimeMillis();
+                                    fr.probing = false;
+                                    fr.notifyAll();
+                                }
+                            }
+                        });
                     }
-                    android.util.Log.d("WebHome", "probeDirect " + host + " -> " + (ok ? "DIRECT" : "PROXY") + " code=" + code);
-                } catch (Throwable t) {
-                    DomainRoute r = routeFor(host);
-                    synchronized (r) {
-                        if (r.mode == ROUTE_UNKNOWN) {
-                            r.mode = ROUTE_PROXY;
-                            r.checkedAt = System.currentTimeMillis();
-                        }
+                    try {
+                        r.wait(7000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return ROUTE_PROXY;
                     }
-                } finally {
-                    PROBING.remove(host);
-                    if (conn != null) {
-                        try {
-                            conn.disconnect();
-                        } catch (Throwable ignored) {
-                        }
-                    }
+                } else if (System.currentTimeMillis() - r.checkedAt > ROUTE_TTL_MILLIS) {
+                    /* 线路记忆过期，重测 */
+                    r.mode = ROUTE_UNKNOWN;
+                } else {
+                    return r.mode;
                 }
             }
-        });
+        }
+    }
+
+    /* 运行中代理拉图成功且无需关键头 = 该域名可直连，就地升级线路 */
+    private static void promoteDirect(String host) {
+        if (TextUtils.isEmpty(host)) return;
+        DomainRoute r = routeFor(host);
+        synchronized (r) {
+            if (r.mode == ROUTE_UNKNOWN) {
+                r.mode = ROUTE_DIRECT;
+                r.checkedAt = System.currentTimeMillis();
+            }
+        }
     }
 
     /*
@@ -652,9 +700,17 @@ public class WebHome extends Spider {
 
             /*
              * 完整 200 的图片响应：边转发边收集，WebView 读完流后
-             * 异步入内存缓存，不给本次响应增加任何延迟。
+             * 异步入内存缓存，不给本次响应增加任何延迟；
+             * 同时代理拉图成功本身就证明该域名可裸访，就地升级直连。
              */
             if (cacheable && responseCode == 200 && data.contentType.startsWith("image/")) {
+                JSONObject hj = null;
+                try {
+                    hj = TextUtils.isEmpty(headersJson) ? null : new JSONObject(headersJson);
+                } catch (Throwable ignored) {
+                }
+                if (!needsCriticalHeader(hj)) promoteDirect(hostOf(targetUrl));
+
                 final String fUrl = targetUrl;
                 final String fHeaders = headersJson;
                 final String fType = data.contentType;
@@ -908,24 +964,17 @@ public class WebHome extends Spider {
                 }
 
                 /*
-                 * 线路分流：需要自定义防盗链头(Referer/Cookie/UA)的域名
-                 * 只能走代理；其余域名第一次走代理兑底并触发后台探测，
-                 * 探测通过后同域名图片直接返回原图 URL（直连线路）。
+                 * 线路分流（先探测、后决策、全域名记忆）：
+                 * 带 Referer/UA 等关键头的域名只能走代理（防盗链）；
+                 * 其余域名首次同步探测，DIRECT 则后续整屏图片
+                 * 直接返回原图 URL，由 WebView 原生加载（最快）。
                  */
                 if (!TextUtils.isEmpty(url) && (url.startsWith("http://") || url.startsWith("https://"))
                         && (headers == null || !needsCriticalHeader(headers))) {
                     String host = hostOf(url);
                     if (!TextUtils.isEmpty(host)) {
-                        DomainRoute r = routeFor(host);
-                        int mode;
-                        synchronized (r) {
-                            if (r.mode != ROUTE_UNKNOWN && System.currentTimeMillis() - r.checkedAt > ROUTE_TTL_MILLIS) {
-                                r.mode = ROUTE_UNKNOWN; /* 线路记忆过期，重测 */
-                            }
-                            mode = r.mode;
-                        }
-                        if (mode == ROUTE_UNKNOWN) probeDirect(host, url);
-                        if (mode == ROUTE_DIRECT) return url;
+                        String hj = headers == null ? null : headers.toString();
+                        if (decideRoute(host, url, hj) == ROUTE_DIRECT) return url;
                     }
                 }
 
