@@ -41,6 +41,7 @@ import java.lang.reflect.Field;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -81,9 +82,10 @@ public class WebHome extends Spider {
      * JS 侧最多只等 PROBE_MAX_WAIT，超时立刻走代理兑底，
      * 探测继续在后台跑完，结果对后续请求生效。
      */
-    private static final int PROBE_CONNECT_TIMEOUT = 600;
-    private static final int PROBE_READ_TIMEOUT = 1500;
+    private static final int PROBE_CONNECT_TIMEOUT = 500;
+    private static final int PROBE_READ_TIMEOUT = 1000;
     private static final long PROBE_MAX_WAIT_MILLIS = 2000L;
+    private static final int PROBE_HEAD_BYTES = 1 * 1024;
     private static final ConcurrentHashMap<String, DomainRoute> DOMAIN_ROUTES = new ConcurrentHashMap<>();
 
     private static final class DomainRoute {
@@ -420,7 +422,7 @@ public class WebHome extends Spider {
     /*
      * 同步短探测 + 全域名阻塞决策：首个图片触发探测（短超时），
      * 同域名其它请求在同一把锁上等结果，整批图片一起拿到线路决策；
-     * 探测成功顺带把首图字节写进内存缓存（走代理兑底时也是秒回）。
+     * 探测只读图片头部几 KB 验证魔数即断开，不下载整张图。
      */
     private static int decideRoute(final String host, final String sampleUrl, final String headersJson) {
         DomainRoute r = routeFor(host);
@@ -435,7 +437,6 @@ public class WebHome extends Spider {
                         final DomainRoute fr = r;
                         final String fHost = host;
                         final String fUrl = sampleUrl;
-                        final String fHj = headersJson;
                         Runnable probeTask = new Runnable() {
                             @Override
                             public void run() {
@@ -454,27 +455,17 @@ public class WebHome extends Spider {
                                     int code = conn.getResponseCode();
                                     String type = conn.getContentType();
                                     boolean ok = code == 200 && type != null && type.toLowerCase().startsWith("image/");
-                                    android.util.Log.d("WebHome", "probeDirect " + fHost + " -> " + (ok ? "DIRECT" : "PROXY") + " code=" + code);
                                     if (ok) {
-                                        mode = ROUTE_DIRECT;
+                                        /*
+                                         * 只读头部几 KB 验证魔数即断开，不下载整张图；
+                                         * 判定走代理时首图由代理正常拉取（缓存兑底）。
+                                         */
                                         InputStream is = conn.getInputStream();
-                                        if (is != null) {
-                                            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                                            byte[] buf = new byte[8192];
-                                            int len;
-                                            while ((len = is.read(buf)) != -1) {
-                                                baos.write(buf, 0, len);
-                                                if (baos.size() > MAX_CACHE_ITEM_BYTES) break;
-                                            }
-                                            is.close();
-                                            byte[] bytes = baos.toByteArray();
-                                            if (bytes.length <= MAX_CACHE_ITEM_BYTES) {
-                                                putCache(cacheKey(fUrl, fHj), new CachedResource(bytes, type,
-                                                        safeHeader(conn, "ETag"), safeHeader(conn, "Last-Modified"),
-                                                        parseMaxAge(safeHeader(conn, "Cache-Control"))));
-                                            }
-                                        }
+                                        ok = is != null && looksLikeImage(readHead(is, PROBE_HEAD_BYTES));
+                                        if (is != null) try { is.close(); } catch (Throwable ignored) {}
                                     }
+                                    android.util.Log.d("WebHome", "probeDirect " + fHost + " -> " + (ok ? "DIRECT" : "PROXY") + " code=" + code);
+                                    if (ok) mode = ROUTE_DIRECT;
                                 } catch (Throwable t) {
                                     mode = ROUTE_PROXY;
                                 } finally {
@@ -532,6 +523,37 @@ public class WebHome extends Spider {
                 r.checkedAt = System.currentTimeMillis();
             }
         }
+    }
+
+    /* 只读探测流的前 limit 字节，读完即返回，配合 disconnect 丢弃剩余响应体 */
+    private static byte[] readHead(InputStream in, int limit) {
+        if (in == null) return new byte[0];
+        try {
+            byte[] head = new byte[limit];
+            int off = 0, n;
+            while (off < limit && (n = in.read(head, off, limit - off)) != -1) off += n;
+            return off == limit ? head : Arrays.copyOf(head, off);
+        } catch (Throwable t) {
+            return new byte[0];
+        }
+    }
+
+    /*
+     * 魔数校验：JPEG/PNG/GIF/WebP/BMP/AVIF(HEIC) 直接通过；
+     * 未知魔数时只要不是 HTML/错误页也放行，兼顾识别
+     * "返回 200 但内容是防盗链提示页" 的假图片。
+     */
+    private static boolean looksLikeImage(byte[] head) {
+        if (head == null || head.length < 4) return false;
+        if ((head[0] & 0xFF) == 0xFF && (head[1] & 0xFF) == 0xD8) return true; /* JPEG */
+        if ((head[0] & 0xFF) == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G') return true; /* PNG */
+        if (head[0] == 'G' && head[1] == 'I' && head[2] == 'F') return true; /* GIF */
+        if (head[0] == 'R' && head[1] == 'I' && head[2] == 'F' && head[3] == 'F'
+                && head.length >= 12 && head[8] == 'W' && head[9] == 'E' && head[10] == 'B' && head[11] == 'P') return true; /* WebP */
+        if (head[0] == 'B' && head[1] == 'M') return true; /* BMP */
+        if (head.length >= 12 && head[4] == 'f' && head[5] == 't' && head[6] == 'y' && head[7] == 'p') return true; /* AVIF/HEIC */
+        String s = new String(head, 0, Math.min(head.length, 64)).toLowerCase();
+        return !(s.contains("<!doctype") || s.contains("<html") || s.contains("<?xml"));
     }
 
     /*
