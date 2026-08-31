@@ -117,10 +117,10 @@ public class WebHome extends Spider {
      * JS 侧最多只等 PROBE_MAX_WAIT，超时立刻走代理兑底，
      * 探测继续在后台跑完，结果对后续请求生效。
      */
-    private static final int PROBE_CONNECT_TIMEOUT = 2000;
-    private static final int PROBE_READ_TIMEOUT = 2500;
+    private static final int PROBE_CONNECT_TIMEOUT = 500;
+    private static final int PROBE_READ_TIMEOUT = 1000;
     private static final long PROBE_MAX_WAIT_MILLIS = 2000L;
-    private static final int PROBE_HEAD_BYTES = 16 * 1024;
+    private static final int PROBE_HEAD_BYTES = 1 * 1024;
     private static final ConcurrentHashMap<String, DomainRoute> DOMAIN_ROUTES = new ConcurrentHashMap<>();
 
     private static final class DomainRoute {
